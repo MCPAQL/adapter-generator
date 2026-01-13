@@ -12,6 +12,10 @@ Suggested self-certification text:
 
 > We certify that we have less than $1,000,000 USD in annual revenue and elect to use MCP-AQL under the free commercial license option.
 
+The commercial license includes restrictions such as **no reverse engineering** and **no competitive re-implementation**. See `spec/COMMERCIAL-LICENSE-TERMS.md` in the MCP-AQL spec repo:
+
+- https://github.com/MCPAQL/spec/blob/main/COMMERCIAL-LICENSE-TERMS.md
+
 ## Paid Commercial License (At/Over $1M Revenue) or Custom Terms
 
 If your organization has **$1,000,000 USD or more in annual revenue**, or if you want custom terms, contact us for a commercial license.

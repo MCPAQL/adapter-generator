@@ -10,6 +10,7 @@ For the full policy spec used to drive implementation, see `spec/docs/licensing-
 - **No output exception is granted.**
   - There is no blanket permission to use generated adapters under terms other than the toolchain/runtime copyleft.
 - A **commercial license** is available as the off‑ramp for closed-source use (see `COMMERCIAL-LICENSE.md`).
+  - Commercial terms include restrictions such as **no reverse engineering** and **no competitive re-implementation** (see `spec/COMMERCIAL-LICENSE-TERMS.md`).
 
 ## Required files in generated adapters
 
@@ -39,4 +40,3 @@ The `schema_fingerprint` must be stable across languages/platforms. Use canonica
 ## Implementation note (for generator authors)
 
 This repo should implement these requirements in the adapter generator output templates/scaffolding so downstream users cannot “accidentally” omit the required licensing/provenance artifacts.
-
