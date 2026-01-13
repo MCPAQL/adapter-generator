@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "MCP-AQL Adapter Generator"
+type: software
+authors:
+  - family-names: "Darling"
+    given-names: "Mick"
+    email: "mick@mickdarling.com"
+url: "https://github.com/MCPAQL/adapter-generator"
+license: "AGPL-3.0"
+
