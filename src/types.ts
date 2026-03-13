@@ -32,7 +32,7 @@ export interface DiscoveryOperation {
 }
 
 export interface DiscoveryBundle {
-  schema_version: "1.0";
+  schema_version: "1.0.0-draft";
   source: {
     name: string;
     server_url: string;
