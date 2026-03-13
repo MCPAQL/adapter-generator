@@ -1,0 +1,27 @@
+{
+  "name": "@mcpaql/adapter-generator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Schema builder and adapter generator for MCP-AQL",
+  "type": "module",
+  "bin": {
+    "mcpaql-schema-build": "./dist/schema-cli.js",
+    "mcpaql-generate-adapter": "./dist/generate-cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "schema:build": "tsx src/schema-cli.ts",
+    "generate": "tsx src/generate-cli.ts"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
