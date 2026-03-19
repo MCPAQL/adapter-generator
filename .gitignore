@@ -30,3 +30,8 @@ CLAUDE.md
 
 # DollhouseMCP (local MCP server state)
 .dollhousemcp/
+
+# Build/install outputs
+node_modules/
+dist/
+*.tsbuildinfo

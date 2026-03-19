@@ -1,0 +1,154 @@
+export type EndpointCategory = "CREATE" | "READ" | "UPDATE" | "DELETE" | "EXECUTE";
+
+export type DangerLevel = "safe" | "reversible" | "destructive" | "dangerous" | "forbidden";
+
+export interface DiscoveryParam {
+  name: string;
+  original_name: string;
+  type: string;
+  required: boolean;
+  description?: string;
+  default?: unknown;
+  enum?: string[];
+  minimum?: number;
+  maximum?: number;
+  pattern?: string;
+  format?: string;
+  source_path: string;
+}
+
+export interface DiscoveryOperation {
+  source_tool_name: string;
+  operation_name: string;
+  description: string;
+  endpoint: EndpointCategory;
+  endpoint_confidence: "high" | "medium" | "low";
+  danger_level: DangerLevel;
+  needs_review: boolean;
+  review_reasons: string[];
+  params: DiscoveryParam[];
+  maps_to: string;
+  title?: string;
+}
+
+export interface DiscoveryBundle {
+  schema_version: "1.0.0-draft";
+  source: {
+    name: string;
+    server_url: string;
+    server?: {
+      name?: string;
+      version?: string;
+      title?: string;
+    };
+    auth: {
+      type: "bearer" | "none";
+      token_env?: string;
+    };
+  };
+  normalized_bundle: {
+    operations: DiscoveryOperation[];
+    warnings: Array<{
+      code: string;
+      severity: "info" | "warning" | "error";
+      message: string;
+      tool?: string;
+      field?: string;
+      heuristic?: string;
+    }>;
+  };
+}
+
+export interface SchemaBuildOverrides {
+  adapter?: {
+    name?: string;
+    version?: string;
+    description?: string;
+    token_env?: string;
+  };
+  // Operation override keys may use either the original source_tool_name or the normalized operation_name.
+  operations?: Record<
+    string,
+    {
+      operation_name?: string;
+      endpoint?: EndpointCategory;
+      danger_level?: Exclude<DangerLevel, "forbidden">;
+      description?: string;
+      needs_review?: boolean;
+      review_reason?: string;
+    }
+  >;
+}
+
+export interface AdapterSchemaOperation {
+  name: string;
+  maps_to: string;
+  description: string;
+  params?: Record<
+    string,
+    {
+      type: string;
+      required?: boolean;
+      description?: string;
+      default?: unknown;
+      enum?: string[];
+      minimum?: number;
+      maximum?: number;
+      pattern?: string;
+      format?: string;
+    }
+  >;
+  response?: {
+    type: "object";
+    description: string;
+  };
+  danger_level?: DangerLevel;
+  requires_confirmation?: boolean;
+  non_idempotent?: boolean;
+}
+
+export interface AdapterSchemaDocument {
+  name: string;
+  type: "adapter";
+  version: string;
+  description: string;
+  target: {
+    base_url: string;
+    transport: "http";
+    protocol: "custom";
+    serialization: "json";
+  };
+  auth?: {
+    type: "bearer";
+    header: "Authorization";
+    prefix: "Bearer ";
+    token_env?: string;
+  };
+  operations: {
+    create?: AdapterSchemaOperation[];
+    read: AdapterSchemaOperation[];
+    update?: AdapterSchemaOperation[];
+    delete?: AdapterSchemaOperation[];
+    execute?: AdapterSchemaOperation[];
+  };
+}
+
+export interface SchemaBuildOutput {
+  schema: AdapterSchemaDocument;
+  metadata: {
+    generated_at: string;
+    source_server_name?: string;
+    source_server_version?: string;
+    source_capture_name: string;
+    warning_count: number;
+    operation_count: number;
+    operations: Array<{
+      source_tool_name: string;
+      operation_name: string;
+      endpoint: EndpointCategory;
+      needs_review: boolean;
+      review_reasons: string[];
+    }>;
+  };
+  warnings: DiscoveryBundle["normalized_bundle"]["warnings"];
+}
