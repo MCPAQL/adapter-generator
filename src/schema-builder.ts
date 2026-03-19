@@ -29,12 +29,13 @@ function validateOverrides(overrides?: SchemaBuildOverrides): void {
       throw new Error(`Invalid override endpoint '${value.endpoint}' for operation key '${key}'.`);
     }
 
-    if (value.danger_level && !VALID_DANGER_LEVELS.has(value.danger_level)) {
-      if (value.danger_level === "forbidden") {
+    const dangerLevel = value.danger_level as string | undefined;
+    if (dangerLevel && !VALID_DANGER_LEVELS.has(dangerLevel)) {
+      if (dangerLevel === "forbidden") {
         throw new Error(`Overrides cannot set danger_level to 'forbidden' for operation key '${key}' - remove the operation from the bundle instead.`);
       }
 
-      throw new Error(`Invalid override danger_level '${value.danger_level}' for operation key '${key}'.`);
+      throw new Error(`Invalid override danger_level '${dangerLevel}' for operation key '${key}'.`);
     }
   }
 }

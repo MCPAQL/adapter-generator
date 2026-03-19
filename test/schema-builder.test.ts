@@ -87,6 +87,7 @@ test("generator writes runnable adapter package inputs", async () => {
   assert.equal(generatedSchema.name, "github-mcp");
   assert.match(serverSource, /operation === "introspect"/);
   assert.match(serverSource, /mcp_aql_read/);
+  assert.match(serverSource, /const token = configured \? process\.env\[configured\] : undefined;/);
   assert.equal(packageJson.engines?.node, ">=20");
   assert.match(readme, /Generated MCP-AQL adapter package/);
 });

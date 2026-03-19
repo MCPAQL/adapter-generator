@@ -72,7 +72,7 @@ export interface SchemaBuildOverrides {
     {
       operation_name?: string;
       endpoint?: EndpointCategory;
-      danger_level?: DangerLevel;
+      danger_level?: Exclude<DangerLevel, "forbidden">;
       description?: string;
       needs_review?: boolean;
       review_reason?: string;

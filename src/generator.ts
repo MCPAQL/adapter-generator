@@ -123,8 +123,9 @@ function resolveToken(): string {
   }
 
   const configured = schema.auth.token_env;
-  if (configured && process.env[configured]) {
-    return process.env[configured];
+  const token = configured ? process.env[configured] : undefined;
+  if (token) {
+    return token;
   }
 
   throw new Error(\`Missing upstream bearer token in env var '\${configured ?? "UPSTREAM_BEARER_TOKEN"}'.\`);
