@@ -66,6 +66,7 @@ export interface SchemaBuildOverrides {
     description?: string;
     token_env?: string;
   };
+  // Operation override keys may use either the original source_tool_name or the normalized operation_name.
   operations?: Record<
     string,
     {
@@ -94,6 +95,7 @@ export interface AdapterSchemaOperation {
       minimum?: number;
       maximum?: number;
       pattern?: string;
+      format?: string;
     }
   >;
   response?: {

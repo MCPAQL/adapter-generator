@@ -41,6 +41,25 @@ function buildEndpointDescriptions(schema: AdapterSchemaDocument): string {
     .join("\n");
 }
 
+function buildRunningSection(schema: AdapterSchemaDocument): string {
+  const authLine =
+    schema.auth?.type === "bearer"
+      ? `Set \`${schema.auth.token_env ?? "UPSTREAM_BEARER_TOKEN"}\` and run:`
+      : "Run:";
+
+  return `## Running
+
+Requires Node.js 20 or newer.
+
+${authLine}
+
+\`\`\`bash
+npm install
+npm run start
+\`\`\`
+`;
+}
+
 function buildServerSource(schema: AdapterSchemaDocument): string {
   return `import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -100,11 +119,15 @@ function textResult(payload: unknown): CallToolResult {
 
 function resolveToken(): string {
   const configured = schema.auth?.token_env;
+  if (!schema.auth || schema.auth.type !== "bearer") {
+    throw new Error("This adapter is not configured for bearer auth.");
+  }
+
   if (configured && process.env[configured]) {
     return process.env[configured];
   }
 
-  throw new Error(\`Missing upstream bearer token in env var '\${configured ?? "GITHUB_PERSONAL_ACCESS_TOKEN"}'.\`);
+  throw new Error(\`Missing upstream bearer token in env var '\${configured ?? "UPSTREAM_BEARER_TOKEN"}'.\`);
 }
 
 async function getUpstreamClient(): Promise<Client> {
@@ -114,9 +137,12 @@ async function getUpstreamClient(): Promise<Client> {
 
   const transport = new StreamableHTTPClientTransport(new URL(schema.target.base_url), {
     requestInit: {
-      headers: {
-        Authorization: \`\${schema.auth?.prefix ?? "Bearer "}\${resolveToken()}\`,
-      },
+      headers:
+        schema.auth?.type === "bearer"
+          ? {
+              Authorization: \`\${schema.auth.prefix ?? "Bearer "}\${resolveToken()}\`,
+            }
+          : undefined,
     },
   });
   const client = new Client({ name: schema.name, version: schema.version });
@@ -135,6 +161,7 @@ function resolveParams(args: OperationArguments | undefined): Record<string, unk
     return {};
   }
 
+  // Flat argument fallback exists for convenience, but it reserves the top-level operation/params keys.
   const clone = { ...args };
   delete clone.operation;
   return clone;
@@ -221,6 +248,7 @@ function buildOperationDetails(name: string) {
       minimum: param.minimum,
       maximum: param.maximum,
       pattern: param.pattern,
+      format: param.format,
     })),
     returns: {
       name: "WrappedToolResult",
@@ -395,6 +423,7 @@ server.setRequestHandler(ListToolsRequestSchema, async (): Promise<ListToolsResu
         required: ["operation"],
       },
       annotations: {
+        // schema.operations keys are lowercase here because they come directly from the JSON schema document.
         readOnlyHint: endpoint === "read",
         destructiveHint: endpoint === "delete" || endpoint === "execute",
       },
@@ -435,11 +464,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 const transport = new StdioServerTransport();
 await server.connect(transport);
 
-process.on("beforeExit", async () => {
+async function closeUpstreamTransport() {
   if (upstreamTransport) {
     await upstreamTransport.close();
+    upstreamTransport = undefined;
+    upstreamClient = undefined;
   }
+}
+
+process.on("beforeExit", async () => {
+  await closeUpstreamTransport();
 });
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    void closeUpstreamTransport().finally(() => process.exit(0));
+  });
+}
 `;
 }
 
@@ -461,6 +502,9 @@ export async function generateAdapterPackage(options: {
     name: packageName(schema),
     private: true,
     type: "module",
+    engines: {
+      node: ">=20",
+    },
     scripts: {
       build: "tsc -p tsconfig.json",
       start: "tsx src/server.ts",
@@ -494,6 +538,6 @@ export async function generateAdapterPackage(options: {
   await writeTextFile(path.join(outDir, "src/server.ts"), buildServerSource(schema));
   await writeTextFile(
     path.join(outDir, "README.md"),
-    `# ${prettyToolName(schema.name)}\n\nGenerated MCP-AQL adapter package for ${adapterReadmeSubject(schema.description)}.\n\n## Supported Endpoints\n\n${buildEndpointDescriptions(schema)}\n\n## Running\n\nSet \`${schema.auth?.token_env ?? "GITHUB_PERSONAL_ACCESS_TOKEN"}\` and run:\n\n\`\`\`bash\nnpm install\nnpm run start\n\`\`\`\n`,
+    `# ${prettyToolName(schema.name)}\n\nGenerated MCP-AQL adapter package for ${adapterReadmeSubject(schema.description)}.\n\n## Supported Endpoints\n\n${buildEndpointDescriptions(schema)}\n\n${buildRunningSection(schema)}`,
   );
 }

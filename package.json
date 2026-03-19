@@ -15,12 +15,10 @@
     "generate": "tsx src/generate-cli.ts"
   },
   "license": "SEE LICENSE IN LICENSE",
-  "dependencies": {
-    "ajv": "^8.17.1",
-    "ajv-formats": "^3.0.1"
-  },
   "devDependencies": {
     "@types/node": "^24.3.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2"
   }

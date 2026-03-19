@@ -8,10 +8,38 @@ import type {
 } from "./types.js";
 import { readJsonFile, writeJsonFile } from "./shared.js";
 
+const ENDPOINT_KEY_BY_CATEGORY = {
+  CREATE: "create",
+  READ: "read",
+  UPDATE: "update",
+  DELETE: "delete",
+  EXECUTE: "execute",
+} as const;
+
+const VALID_ENDPOINTS = new Set(["CREATE", "READ", "UPDATE", "DELETE", "EXECUTE"]);
+const VALID_DANGER_LEVELS = new Set(["safe", "reversible", "destructive", "dangerous", "forbidden"]);
+
+function validateOverrides(overrides?: SchemaBuildOverrides): void {
+  if (!overrides?.operations) {
+    return;
+  }
+
+  for (const [key, value] of Object.entries(overrides.operations)) {
+    if (value.endpoint && !VALID_ENDPOINTS.has(value.endpoint)) {
+      throw new Error(`Invalid override endpoint '${value.endpoint}' for operation key '${key}'.`);
+    }
+
+    if (value.danger_level && !VALID_DANGER_LEVELS.has(value.danger_level)) {
+      throw new Error(`Invalid override danger_level '${value.danger_level}' for operation key '${key}'.`);
+    }
+  }
+}
+
 function applyOverrides(
   operation: DiscoveryOperation,
   overrides?: SchemaBuildOverrides["operations"],
 ): DiscoveryOperation {
+  // Prefer source_tool_name when both keys exist so pre-normalized bundles stay stable across rename overrides.
   const override = overrides?.[operation.source_tool_name] ?? overrides?.[operation.operation_name];
   if (!override) {
     return operation;
@@ -49,10 +77,15 @@ function toSchemaOperation(operation: DiscoveryOperation): AdapterSchemaOperatio
               minimum: param.minimum,
               maximum: param.maximum,
               pattern: param.pattern,
+              format: param.format,
             },
           ]),
         )
       : undefined;
+
+  if (operation.danger_level === "forbidden") {
+    throw new Error(`Operation '${operation.operation_name}' cannot be emitted because danger_level 'forbidden' is not runnable.`);
+  }
 
   return {
     name: operation.operation_name,
@@ -70,7 +103,7 @@ function toSchemaOperation(operation: DiscoveryOperation): AdapterSchemaOperatio
 }
 
 function endpointKey(endpoint: DiscoveryOperation["endpoint"]): keyof AdapterSchemaDocument["operations"] {
-  return endpoint.toLowerCase() as keyof AdapterSchemaDocument["operations"];
+  return ENDPOINT_KEY_BY_CATEGORY[endpoint];
 }
 
 export async function buildSchemaFromBundle(options: {
@@ -81,10 +114,11 @@ export async function buildSchemaFromBundle(options: {
   const overrides = options.overridesPath
     ? await readJsonFile<SchemaBuildOverrides>(options.overridesPath)
     : undefined;
+  validateOverrides(overrides);
 
   const operations = bundle.normalized_bundle.operations.map((operation) => applyOverrides(operation, overrides?.operations));
   const adapterName = overrides?.adapter?.name ?? `${bundle.source.name}-adapter`;
-  const tokenEnv = overrides?.adapter?.token_env ?? bundle.source.auth.token_env ?? "GITHUB_PERSONAL_ACCESS_TOKEN";
+  const tokenEnv = overrides?.adapter?.token_env ?? bundle.source.auth.token_env;
 
   const schema: AdapterSchemaDocument = {
     name: adapterName,
@@ -117,7 +151,7 @@ export async function buildSchemaFromBundle(options: {
     const key = endpointKey(operation.endpoint);
     const list = schema.operations[key] ?? [];
     list.push(toSchemaOperation(operation));
-    schema.operations[key] = list as never;
+    schema.operations[key] = list;
   }
 
   const output: SchemaBuildOutput = {
