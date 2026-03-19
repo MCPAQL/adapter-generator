@@ -141,6 +141,31 @@ test("schema builder rejects invalid override danger level values", async () => 
   );
 });
 
+test("schema builder rejects forbidden danger level overrides with a targeted message", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-forbidden-danger-"));
+  const invalidOverridesPath = path.join(tempRoot, "overrides.json");
+
+  await writeFile(
+    invalidOverridesPath,
+    JSON.stringify({
+      operations: {
+        list_branches: {
+          danger_level: "forbidden",
+        },
+      },
+    }),
+    "utf8",
+  );
+
+  await assert.rejects(
+    buildSchemaFromBundle({
+      bundlePath,
+      overridesPath: invalidOverridesPath,
+    }),
+    /Overrides cannot set danger_level to 'forbidden'/,
+  );
+});
+
 test("schema builder omits auth block for auth.type none", async () => {
   const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-no-auth-"));
   const tempBundlePath = path.join(tempRoot, "bundle.json");
@@ -229,4 +254,9 @@ test("schema builder prefers source_tool_name overrides when both override keys 
   );
 
   assert.ok(rebuiltOperation, "expected overridden operation to remain in UPDATE");
+  const rebuiltMetadata = output.metadata.operations.find(
+    (operation) => operation.operation_name === "renamed_operation",
+  );
+  assert.ok(rebuiltMetadata?.review_reasons.includes("source_tool_name override should win"));
+  assert.ok(!rebuiltMetadata?.review_reasons.includes("operation_name override should lose to source_tool_name"));
 });

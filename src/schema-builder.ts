@@ -17,7 +17,7 @@ const ENDPOINT_KEY_BY_CATEGORY = {
 } as const;
 
 const VALID_ENDPOINTS = new Set(["CREATE", "READ", "UPDATE", "DELETE", "EXECUTE"]);
-const VALID_DANGER_LEVELS = new Set(["safe", "reversible", "destructive", "dangerous", "forbidden"]);
+const VALID_DANGER_LEVELS = new Set(["safe", "reversible", "destructive", "dangerous"]);
 
 function validateOverrides(overrides?: SchemaBuildOverrides): void {
   if (!overrides?.operations) {
@@ -30,6 +30,10 @@ function validateOverrides(overrides?: SchemaBuildOverrides): void {
     }
 
     if (value.danger_level && !VALID_DANGER_LEVELS.has(value.danger_level)) {
+      if (value.danger_level === "forbidden") {
+        throw new Error(`Overrides cannot set danger_level to 'forbidden' for operation key '${key}' - remove the operation from the bundle instead.`);
+      }
+
       throw new Error(`Invalid override danger_level '${value.danger_level}' for operation key '${key}'.`);
     }
   }

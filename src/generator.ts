@@ -118,11 +118,11 @@ function textResult(payload: unknown): CallToolResult {
 }
 
 function resolveToken(): string {
-  const configured = schema.auth?.token_env;
   if (!schema.auth || schema.auth.type !== "bearer") {
     throw new Error("This adapter is not configured for bearer auth.");
   }
 
+  const configured = schema.auth.token_env;
   if (configured && process.env[configured]) {
     return process.env[configured];
   }
@@ -164,6 +164,7 @@ function resolveParams(args: OperationArguments | undefined): Record<string, unk
   // Flat argument fallback exists for convenience, but it reserves the top-level operation/params keys.
   const clone = { ...args };
   delete clone.operation;
+  delete clone.params;
   return clone;
 }
 
