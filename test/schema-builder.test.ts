@@ -88,8 +88,62 @@ test("generator writes runnable adapter package inputs", async () => {
   assert.match(serverSource, /operation === "introspect"/);
   assert.match(serverSource, /mcp_aql_read/);
   assert.match(serverSource, /const token = configured \? process\.env\[configured\] : undefined;/);
+  assert.match(serverSource, /const schema = rawSchema as AdapterSchema;/);
   assert.equal(packageJson.engines?.node, ">=20");
   assert.match(readme, /Generated MCP-AQL adapter package/);
+});
+
+test("generator emits server source that tolerates missing auth and partial endpoint sets", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-partial-schema-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "playwright-mcp",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for the official Playwright MCP server.",
+      target: {
+        base_url: "http://localhost:8931/mcp",
+        transport: "http",
+        protocol: "custom",
+        serialization: "json",
+      },
+      operations: {
+        read: [
+          {
+            name: "browser_console_messages",
+            maps_to: "tool:browser_console_messages",
+            description: "Returns all console messages",
+          },
+        ],
+        execute: [
+          {
+            name: "browser_click",
+            maps_to: "tool:browser_click",
+            description: "Perform click on a web page",
+            non_idempotent: true,
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+
+  await generateAdapterPackage({
+    schemaPath,
+    provenancePath,
+    outDir: adapterOutDir,
+  });
+
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+  assert.match(serverSource, /type EndpointKey = "create" \| "read" \| "update" \| "delete" \| "execute";/);
+  assert.match(serverSource, /auth\?: \{/);
+  assert.match(serverSource, /const schema = rawSchema as AdapterSchema;/);
 });
 
 test("schema builder rejects invalid override endpoint values", async () => {

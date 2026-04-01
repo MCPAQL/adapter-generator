@@ -74,13 +74,53 @@ import type {
   CallToolResult,
   ListToolsResult,
 } from "@modelcontextprotocol/sdk/types.js";
-import schema from "./schema.json" with { type: "json" };
+import rawSchema from "./schema.json" with { type: "json" };
 import provenance from "./provenance.json" with { type: "json" };
 
-type SchemaOperations = typeof schema.operations;
-type EndpointKey = keyof SchemaOperations;
-type EndpointName = Uppercase<EndpointKey>;
-type OperationDefinition = NonNullable<SchemaOperations[EndpointKey]>[number];
+type EndpointKey = "create" | "read" | "update" | "delete" | "execute";
+type EndpointName = "CREATE" | "READ" | "UPDATE" | "DELETE" | "EXECUTE";
+type OperationParam = {
+  type: string;
+  required?: boolean;
+  description?: string;
+  default?: unknown;
+  enum?: string[];
+  minimum?: number;
+  maximum?: number;
+  pattern?: string;
+  format?: string;
+};
+type OperationDefinition = {
+  name: string;
+  maps_to: string;
+  description: string;
+  params?: Record<string, OperationParam>;
+  response?: {
+    type?: "object";
+    description?: string;
+  };
+  danger_level?: string;
+  requires_confirmation?: boolean;
+  non_idempotent?: boolean;
+};
+type AdapterSchema = {
+  name: string;
+  version: string;
+  description: string;
+  target: {
+    base_url: string;
+    transport: string;
+    protocol: string;
+    serialization: string;
+  };
+  auth?: {
+    type: "bearer";
+    header?: string;
+    prefix?: string;
+    token_env?: string;
+  };
+  operations: Partial<Record<EndpointKey, OperationDefinition[]>>;
+};
 type OperationIndexEntry = {
   endpoint: EndpointName;
   definition: OperationDefinition;
@@ -89,6 +129,8 @@ type OperationArguments = Record<string, unknown> & {
   operation?: unknown;
   params?: unknown;
 };
+
+const schema = rawSchema as AdapterSchema;
 
 const TOOL_NAME_BY_ENDPOINT: Record<EndpointName, string> = {
   CREATE: "mcp_aql_create",
