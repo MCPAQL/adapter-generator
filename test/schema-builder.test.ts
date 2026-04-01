@@ -94,7 +94,7 @@ test("generator writes runnable adapter package inputs", async () => {
   assert.match(serverSource, /const token = configured \? process\.env\[configured\] : undefined;/);
   assert.match(serverSource, /function resolveBaseUrl/);
   assert.match(serverSource, /process\.env\.MCPAQL_TARGET_BASE_URL\?\.trim\(\)/);
-  assert.match(serverSource, /const schema = rawSchema as AdapterSchema;/);
+  assert.match(serverSource, /const schema = rawSchema as unknown as AdapterSchema;/);
   assert.match(serverSource, /function mapParamsToUpstream/);
   assert.match(serverSource, /arguments: upstreamParams/);
   assert.equal(packageJson.engines?.node, ">=20");
@@ -153,7 +153,7 @@ test("generator emits server source that tolerates missing auth and partial endp
   assert.match(serverSource, /type EndpointKey = "create" \| "read" \| "update" \| "delete" \| "execute";/);
   assert.match(serverSource, /auth\?: \{/);
   assert.match(serverSource, /new URL\(resolveBaseUrl\(\)\)/);
-  assert.match(serverSource, /const schema = rawSchema as AdapterSchema;/);
+  assert.match(serverSource, /const schema = rawSchema as unknown as AdapterSchema;/);
 });
 
 test("generator emits upstream param remapping from provenance metadata", async () => {
