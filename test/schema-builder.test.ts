@@ -92,11 +92,14 @@ test("generator writes runnable adapter package inputs", async () => {
   assert.match(serverSource, /operation === "introspect"/);
   assert.match(serverSource, /mcp_aql_read/);
   assert.match(serverSource, /const token = configured \? process\.env\[configured\] : undefined;/);
+  assert.match(serverSource, /function resolveBaseUrl/);
+  assert.match(serverSource, /process\.env\.MCPAQL_TARGET_BASE_URL\?\.trim\(\)/);
   assert.match(serverSource, /const schema = rawSchema as AdapterSchema;/);
   assert.match(serverSource, /function mapParamsToUpstream/);
   assert.match(serverSource, /arguments: upstreamParams/);
   assert.equal(packageJson.engines?.node, ">=20");
   assert.match(readme, /Generated MCP-AQL adapter package/);
+  assert.match(readme, /MCPAQL_TARGET_BASE_URL/);
 });
 
 test("generator emits server source that tolerates missing auth and partial endpoint sets", async () => {
@@ -149,6 +152,7 @@ test("generator emits server source that tolerates missing auth and partial endp
   const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
   assert.match(serverSource, /type EndpointKey = "create" \| "read" \| "update" \| "delete" \| "execute";/);
   assert.match(serverSource, /auth\?: \{/);
+  assert.match(serverSource, /new URL\(resolveBaseUrl\(\)\)/);
   assert.match(serverSource, /const schema = rawSchema as AdapterSchema;/);
 });
 
