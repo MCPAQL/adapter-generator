@@ -168,13 +168,22 @@ export async function buildSchemaFromBundle(options: {
       source_capture_name: bundle.source.name,
       warning_count: bundle.normalized_bundle.warnings.length,
       operation_count: operations.length,
-      operations: operations.map((operation) => ({
-        source_tool_name: operation.source_tool_name,
-        operation_name: operation.operation_name,
-        endpoint: operation.endpoint,
-        needs_review: operation.needs_review,
-        review_reasons: operation.review_reasons,
-      })),
+      operations: operations.map((operation) => {
+        const paramMappings = Object.fromEntries(
+          operation.params
+            .filter((param) => param.name !== param.original_name)
+            .map((param) => [param.name, param.original_name]),
+        );
+
+        return {
+          source_tool_name: operation.source_tool_name,
+          operation_name: operation.operation_name,
+          endpoint: operation.endpoint,
+          needs_review: operation.needs_review,
+          review_reasons: operation.review_reasons,
+          param_mappings: Object.keys(paramMappings).length > 0 ? paramMappings : undefined,
+        };
+      }),
     },
     warnings: bundle.normalized_bundle.warnings,
   };
