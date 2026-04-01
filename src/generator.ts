@@ -125,12 +125,19 @@ type OperationIndexEntry = {
   endpoint: EndpointName;
   definition: OperationDefinition;
 };
+type AdapterProvenance = {
+  operations?: Array<{
+    operation_name: string;
+    param_mappings?: Record<string, string>;
+  }>;
+};
 type OperationArguments = Record<string, unknown> & {
   operation?: unknown;
   params?: unknown;
 };
 
 const schema = rawSchema as AdapterSchema;
+const adapterProvenance = provenance as AdapterProvenance;
 
 const TOOL_NAME_BY_ENDPOINT: Record<EndpointName, string> = {
   CREATE: "mcp_aql_create",
@@ -147,6 +154,13 @@ for (const [endpoint, operations] of Object.entries(schema.operations) as Array<
       endpoint: endpoint.toUpperCase() as EndpointName,
       definition: operation,
     });
+  }
+}
+
+const PARAM_MAPPINGS_BY_OPERATION = new Map<string, Record<string, string>>();
+for (const entry of adapterProvenance.operations ?? []) {
+  if (entry.param_mappings && Object.keys(entry.param_mappings).length > 0) {
+    PARAM_MAPPINGS_BY_OPERATION.set(entry.operation_name, entry.param_mappings);
   }
 }
 
@@ -209,6 +223,17 @@ function resolveParams(args: OperationArguments | undefined): Record<string, unk
   delete clone.operation;
   delete clone.params;
   return clone;
+}
+
+function mapParamsToUpstream(operationName: string, params: Record<string, unknown>): Record<string, unknown> {
+  const paramMappings = PARAM_MAPPINGS_BY_OPERATION.get(operationName);
+  if (!paramMappings) {
+    return params;
+  }
+
+  return Object.fromEntries(
+    Object.entries(params).map(([paramName, value]) => [paramMappings[paramName] ?? paramName, value]),
+  );
 }
 
 function buildToolDescription(endpoint: EndpointName, operations: OperationDefinition[]): string {
@@ -414,9 +439,10 @@ async function proxyOperation(operationName: string, params: Record<string, unkn
 
   const upstream = await getUpstreamClient();
   const sourceTool = item.definition.maps_to.replace(/^tool:/, "");
+  const upstreamParams = mapParamsToUpstream(operationName, params);
   const result = await upstream.callTool({
     name: sourceTool,
-    arguments: params,
+    arguments: upstreamParams,
   });
 
   if (result.isError) {

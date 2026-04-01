@@ -148,6 +148,7 @@ export interface SchemaBuildOutput {
       endpoint: EndpointCategory;
       needs_review: boolean;
       review_reasons: string[];
+      param_mappings?: Record<string, string>;
     }>;
   };
   warnings: DiscoveryBundle["normalized_bundle"]["warnings"];

@@ -174,6 +174,11 @@ export async function buildSchemaFromBundle(options: {
         endpoint: operation.endpoint,
         needs_review: operation.needs_review,
         review_reasons: operation.review_reasons,
+        param_mappings: Object.fromEntries(
+          operation.params
+            .filter((param) => param.name !== param.original_name)
+            .map((param) => [param.name, param.original_name]),
+        ),
       })),
     },
     warnings: bundle.normalized_bundle.warnings,

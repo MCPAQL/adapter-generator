@@ -45,6 +45,9 @@ test("schema builder emits spec-valid adapter schema with github overrides appli
   assert.equal(output.schema.name, "github-mcp");
   assert.ok(output.metadata.operation_count > 0);
   assert.equal(output.schema.auth?.token_env, "GITHUB_PERSONAL_ACCESS_TOKEN");
+  const addCommentToPendingReviewOperation = output.metadata.operations.find(
+    (operation) => operation.operation_name === "add_comment_to_pending_review",
+  );
 
   const updateOperations = new Set((output.schema.operations.update ?? []).map((operation) => operation.name));
   const executeOperations = new Set((output.schema.operations.execute ?? []).map((operation) => operation.name));
@@ -57,6 +60,7 @@ test("schema builder emits spec-valid adapter schema with github overrides appli
   assert.ok(executeOperations.has("create_pull_request_with_copilot"));
   assert.ok(executeOperations.has("merge_pull_request"));
   assert.equal(executeOperation?.non_idempotent, true);
+  assert.equal(addCommentToPendingReviewOperation?.param_mappings?.pull_number, "pullNumber");
 });
 
 test("generator writes runnable adapter package inputs", async () => {
@@ -89,6 +93,8 @@ test("generator writes runnable adapter package inputs", async () => {
   assert.match(serverSource, /mcp_aql_read/);
   assert.match(serverSource, /const token = configured \? process\.env\[configured\] : undefined;/);
   assert.match(serverSource, /const schema = rawSchema as AdapterSchema;/);
+  assert.match(serverSource, /function mapParamsToUpstream/);
+  assert.match(serverSource, /arguments: upstreamParams/);
   assert.equal(packageJson.engines?.node, ">=20");
   assert.match(readme, /Generated MCP-AQL adapter package/);
 });
@@ -144,6 +150,65 @@ test("generator emits server source that tolerates missing auth and partial endp
   assert.match(serverSource, /type EndpointKey = "create" \| "read" \| "update" \| "delete" \| "execute";/);
   assert.match(serverSource, /auth\?: \{/);
   assert.match(serverSource, /const schema = rawSchema as AdapterSchema;/);
+});
+
+test("generator emits upstream param remapping from provenance metadata", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-param-mapping-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "playwright-mcp",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for the official Playwright MCP server.",
+      target: {
+        base_url: "http://localhost:8931/mcp",
+        transport: "http",
+        protocol: "custom",
+        serialization: "json",
+      },
+      operations: {
+        execute: [
+          {
+            name: "browser_click",
+            maps_to: "tool:browser_click",
+            description: "Perform click on a web page",
+          },
+        ],
+        read: [],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    provenancePath,
+    JSON.stringify({
+      generated_at: new Date().toISOString(),
+      operations: [
+        {
+          operation_name: "browser_click",
+          param_mappings: {
+            double_click: "doubleClick",
+          },
+        },
+      ],
+    }),
+    "utf8",
+  );
+
+  await generateAdapterPackage({
+    schemaPath,
+    provenancePath,
+    outDir: adapterOutDir,
+  });
+
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+  assert.match(serverSource, /const PARAM_MAPPINGS_BY_OPERATION = new Map/);
+  assert.match(serverSource, /paramMappings\[paramName\] \?\? paramName/);
 });
 
 test("schema builder rejects invalid override endpoint values", async () => {
