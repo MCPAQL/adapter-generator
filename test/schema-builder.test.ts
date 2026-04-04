@@ -497,3 +497,103 @@ test("schema builder prefers source_tool_name overrides when both override keys 
   assert.ok(rebuiltMetadata?.review_reasons.includes("source_tool_name override should win"));
   assert.ok(!rebuiltMetadata?.review_reasons.includes("operation_name override should lose to source_tool_name"));
 });
+
+test("generated native-applescript source contains JXA security validation helpers", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-jxa-security-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-notes",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Notes.",
+      target: {
+        base_url: "native-applescript://Notes",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        application: "Notes",
+      },
+      operations: {
+        read: [
+          {
+            name: "list_notes",
+            maps_to: "native-applescript:command:notes",
+            description: "List all notes.",
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+
+  await generateAdapterPackage({
+    schemaPath,
+    provenancePath,
+    outDir: adapterOutDir,
+  });
+
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+
+  // Verify the three security helpers are present in the generated source
+  assert.match(serverSource, /function validateParamKey\(key: string\): string/);
+  assert.match(serverSource, /function validateJxaIdentifier\(value: string, label: string\): string/);
+  assert.match(serverSource, /function sanitizeForJxa\(value: unknown\): string/);
+
+  // Verify the validation regex patterns reject adversarial inputs
+  // validateParamKey uses ^[a-zA-Z_][w]*$ — rejects keys with special chars
+  assert.match(serverSource, /\/\^\[a-zA-Z_\]\[w\]\*\$\//);
+  // validateJxaIdentifier uses ^[a-zA-Z_][w.]*$ — rejects identifiers with injection chars
+  assert.match(serverSource, /\/\^\[a-zA-Z_\]\[w\.\]\*\$\//);
+  // sanitizeForJxa uses JSON.stringify for string escaping
+  assert.match(serverSource, /JSON\.stringify\(value\)/);
+});
+
+test("generator throws when native-applescript schema is missing target.application", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-missing-app-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-mail",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Mail.",
+      target: {
+        base_url: "native-applescript://Mail",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        // deliberately omit application
+      },
+      operations: {
+        read: [
+          {
+            name: "list_accounts",
+            maps_to: "native-applescript:command:accounts",
+            description: "List mail accounts.",
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+
+  await assert.rejects(
+    generateAdapterPackage({
+      schemaPath,
+      provenancePath,
+      outDir: adapterOutDir,
+    }),
+    /native-applescript adapter schema requires target\.application/,
+  );
+});

@@ -939,6 +939,11 @@ export async function generateAdapterPackage(options: {
     : { generated_at: new Date().toISOString() };
 
   const outDir = options.outDir;
+
+  if (schema.target.transport === "native-applescript" && !schema.target.application) {
+    throw new Error("native-applescript adapter schema requires target.application");
+  }
+
   await writeJsonFile(path.join(outDir, "src/schema.json"), schema);
   await writeJsonFile(path.join(outDir, "src/provenance.json"), provenance);
 
