@@ -337,6 +337,119 @@ test("schema builder preserves param format when present in the bundle", async (
   assert.equal(rebuiltOperation?.params?.created_at?.format, "date-time");
 });
 
+test("schema builder detects native-applescript transport from source metadata", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-native-transport-"));
+  const tempBundlePath = path.join(tempRoot, "bundle.json");
+
+  await writeFile(
+    tempBundlePath,
+    JSON.stringify({
+      schema_version: "1.0.0-draft",
+      source: {
+        name: "mail-app",
+        server_url: "native-applescript://Mail",
+        server: { name: "Mail", version: "native" },
+        auth: { type: "none" },
+        capture_config_redacted: { transport: "native-applescript", application: "Mail" },
+      },
+      normalized_bundle: {
+        operations: [
+          {
+            source_tool_name: "get",
+            operation_name: "get",
+            description: "Get data from an object.",
+            endpoint: "READ",
+            endpoint_confidence: "high",
+            danger_level: "safe",
+            needs_review: false,
+            review_reasons: [],
+            params: [],
+            maps_to: "native-applescript:command:get",
+          },
+        ],
+        warnings: [],
+      },
+    }),
+    "utf8",
+  );
+
+  const output = await buildSchemaFromBundle({ bundlePath: tempBundlePath });
+  assert.equal(output.schema.target.transport, "native-applescript");
+  assert.equal(output.schema.target.application, "Mail");
+  assert.equal(output.schema.auth, undefined);
+});
+
+test("generator produces native-applescript server source", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-native-server-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-mail",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Mail.",
+      target: {
+        base_url: "native-applescript://Mail",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        application: "Mail",
+      },
+      operations: {
+        read: [
+          {
+            name: "list_accounts",
+            maps_to: "native-applescript:command:accounts",
+            description: "List mail accounts.",
+          },
+        ],
+        update: [
+          {
+            name: "set_message_read_status",
+            maps_to: "native-applescript:set_property:message.readStatus",
+            description: "Set read status of a message.",
+            params: {
+              message_specifier: { type: "string", required: true, description: "Message specifier" },
+              value: { type: "boolean", required: true, description: "New read status" },
+            },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+
+  await generateAdapterPackage({
+    schemaPath,
+    provenancePath,
+    outDir: adapterOutDir,
+  });
+
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+  const readme = await readFile(path.join(adapterOutDir, "README.md"), "utf8");
+
+  // Verify native transport-specific code
+  assert.match(serverSource, /osascript/);
+  assert.match(serverSource, /execFile/);
+  assert.match(serverSource, /buildJxaScript/);
+  assert.match(serverSource, /sanitizeForJxa/);
+  assert.match(serverSource, /operation === "introspect"/);
+  assert.match(serverSource, /mcp_aql_read/);
+
+  // Verify it does NOT contain upstream HTTP client code
+  assert.ok(!serverSource.includes("StreamableHTTPClientTransport"));
+  assert.ok(!serverSource.includes("resolveToken"));
+
+  // Verify README mentions native transport
+  assert.match(readme, /osascript/);
+  assert.match(readme, /Mail/);
+});
+
 test("schema builder prefers source_tool_name overrides when both override keys are present", async () => {
   const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-override-precedence-"));
   const precedenceOverridesPath = path.join(tempRoot, "overrides.json");
