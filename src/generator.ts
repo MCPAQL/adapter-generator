@@ -138,7 +138,8 @@ type OperationIndexEntry = {
 };
 
 const schema = rawSchema as unknown as AdapterSchema;
-const APPLICATION = schema.target.application ?? "Mail";
+if (!schema.target.application) throw new Error("native-applescript schema is missing target.application");
+const APPLICATION = schema.target.application;
 const TIMEOUT_MS = 30_000;
 const MAX_OUTPUT = 10 * 1024 * 1024;
 
@@ -195,6 +196,27 @@ function sanitizeForJxa(value: unknown): string {
 }
 
 /**
+ * Validate that a string is a safe JXA identifier (letters, digits, underscores, dots).
+ * Dots are allowed because maps_to targets use "class.property" notation.
+ */
+function validateJxaIdentifier(value: string, label: string): string {
+  if (!/^[a-zA-Z_][\w.]*$/.test(value)) {
+    throw new Error(\`Invalid \${label}: '\${value}' is not a safe identifier.\`);
+  }
+  return value;
+}
+
+/**
+ * Validate that a param key is a safe JavaScript identifier.
+ */
+function validateParamKey(key: string): string {
+  if (!/^[a-zA-Z_][\w]*$/.test(key)) {
+    throw new Error(\`Invalid parameter key: '\${key}' is not a safe identifier.\`);
+  }
+  return key;
+}
+
+/**
  * Build a JXA script for a native-applescript operation.
  * The maps_to format is: native-applescript:<type>:<target>
  *   - command:<name> -> executes an AppleScript command
@@ -212,8 +234,9 @@ function buildJxaScript(mapsTo: string, params: Record<string, unknown>): string
   switch (actionType) {
     case "command": {
       // Generic command execution via JXA
+      validateJxaIdentifier(target.replace(/\\s+/g, ""), "command target");
       const sanitizedParams = Object.entries(params)
-        .map(([key, value]) => \`  \${key}: \${sanitizeForJxa(value)}\`)
+        .map(([key, value]) => \`  \${validateParamKey(key)}: \${sanitizeForJxa(value)}\`)
         .join(",\\n");
       const paramBlock = sanitizedParams ? \`{\\n\${sanitizedParams}\\n}\` : "{}";
       return [
@@ -226,6 +249,8 @@ function buildJxaScript(mapsTo: string, params: Record<string, unknown>): string
 
     case "get_property": {
       const [className, propName] = target.split(".");
+      validateJxaIdentifier(className.replace(/\\s+/g, ""), "get_property class");
+      validateJxaIdentifier(propName.replace(/\\s+/g, ""), "get_property property");
       const specifier = sanitizeForJxa(params[\`\${className.toLowerCase()}_specifier\`] ?? params.target ?? 1);
       return [
         "ObjC.import('stdlib');",
@@ -239,6 +264,8 @@ function buildJxaScript(mapsTo: string, params: Record<string, unknown>): string
 
     case "set_property": {
       const [className2, propName2] = target.split(".");
+      validateJxaIdentifier(className2.replace(/\\s+/g, ""), "set_property class");
+      validateJxaIdentifier(propName2.replace(/\\s+/g, ""), "set_property property");
       const specifier2 = sanitizeForJxa(params[\`\${className2.toLowerCase()}_specifier\`] ?? params.target ?? 1);
       const newValue = sanitizeForJxa(params.value);
       return [
@@ -253,6 +280,8 @@ function buildJxaScript(mapsTo: string, params: Record<string, unknown>): string
 
     case "list_elements": {
       const [className3, elementType] = target.split(".");
+      validateJxaIdentifier(className3.replace(/\\s+/g, ""), "list_elements class");
+      validateJxaIdentifier(elementType.replace(/\\s+/g, ""), "list_elements element type");
       const specifier3 = sanitizeForJxa(params[\`\${className3.toLowerCase()}_specifier\`] ?? params.target ?? 1);
       return [
         "ObjC.import('stdlib');",
@@ -917,10 +946,7 @@ export async function generateAdapterPackage(options: {
     ? buildNativeAppleScriptServerSource(schema)
     : buildServerSource(schema);
 
-  // Native transport doesn't need the upstream MCP SDK dependency
-  const dependencies: Record<string, string> = schema.target.transport === "native-applescript"
-    ? { "@modelcontextprotocol/sdk": "^1.27.1" }
-    : { "@modelcontextprotocol/sdk": "^1.27.1" };
+  const dependencies: Record<string, string> = { "@modelcontextprotocol/sdk": "^1.27.1" };
 
   await writeJsonFile(path.join(outDir, "package.json"), {
     name: packageName(schema),
