@@ -200,7 +200,7 @@ function sanitizeForJxa(value: unknown): string {
  * Dots are allowed because maps_to targets use "class.property" notation.
  */
 function validateJxaIdentifier(value: string, label: string): string {
-  if (!/^[a-zA-Z_][\w.]*$/.test(value)) {
+  if (!/^[a-zA-Z_][\\w.]*$/.test(value)) {
     throw new Error(\`Invalid \${label}: '\${value}' is not a safe identifier.\`);
   }
   return value;
@@ -210,7 +210,7 @@ function validateJxaIdentifier(value: string, label: string): string {
  * Validate that a param key is a safe JavaScript identifier.
  */
 function validateParamKey(key: string): string {
-  if (!/^[a-zA-Z_][\w]*$/.test(key)) {
+  if (!/^[a-zA-Z_][\\w]*$/.test(key)) {
     throw new Error(\`Invalid parameter key: '\${key}' is not a safe identifier.\`);
   }
   return key;
