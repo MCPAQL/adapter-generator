@@ -101,6 +101,54 @@ function globToRegex(pattern: string): RegExp {
  * In both modes, `exclude_patterns` removes any operations whose name matches
  * a glob pattern.
  */
+/**
+ * Inject template-only operations into the schema. Templates that define an
+ * `endpoint` field but have no matching operation in the schema are added as
+ * synthetic operations. This bridges the granularity gap between sdef-derived
+ * atomic operations and hand-authored composite templates.
+ */
+export function injectTemplateOperations(
+  schema: AdapterSchemaDocument,
+  templates: TemplateOverridesDocument,
+): AdapterSchemaDocument {
+  const existingOps = new Set<string>();
+  for (const ops of Object.values(schema.operations)) {
+    for (const op of ops ?? []) {
+      existingOps.add(op.name);
+    }
+  }
+
+  const result = { ...schema, operations: { ...schema.operations } };
+
+  for (const [name, tmpl] of Object.entries(templates.templates)) {
+    if (existingOps.has(name)) continue; // Already in schema — template is an override, not injection
+    if (!tmpl.endpoint) continue; // No endpoint declared — can't inject without knowing the CRUDE category
+
+    const params: AdapterSchemaOperation["params"] = tmpl.params
+      ? Object.fromEntries(
+          Object.entries(tmpl.params).map(([pName, pDef]) => [
+            pName,
+            { type: pDef.type, required: !pDef.optional, description: pDef.description },
+          ]),
+        )
+      : undefined;
+
+    const syntheticOp: AdapterSchemaOperation = {
+      name,
+      maps_to: `template:${name}`,
+      description: tmpl.description ?? `Template-defined operation: ${name}`,
+      params,
+      danger_level: tmpl.danger_level ?? (tmpl.endpoint === "delete" ? "destructive" : "safe"),
+    };
+
+    const endpoint = tmpl.endpoint;
+    const existing = result.operations[endpoint] ?? [];
+    result.operations[endpoint] = [...existing, syntheticOp];
+  }
+
+  return result;
+}
+
 export function applyCuration(
   schema: AdapterSchemaDocument,
   curation: CurationDocument,
@@ -1024,10 +1072,11 @@ export async function generateAdapterPackage(options: {
     schema = applyCuration(schema, curation);
   }
 
-  // Load template overrides
+  // Load template overrides and inject template-only operations into the schema
   let templatesDoc: TemplateOverridesDocument | undefined;
   if (options.templatesPath) {
     templatesDoc = await readJsonFile<TemplateOverridesDocument>(options.templatesPath);
+    schema = injectTemplateOperations(schema, templatesDoc);
   }
 
   if (schema.target.transport === "native-applescript" && !schema.target.application) {

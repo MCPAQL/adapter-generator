@@ -159,7 +159,13 @@ export interface SchemaBuildOutput {
 export interface TemplateOverride {
   language: "JavaScript" | "AppleScript";
   script: string;
-  params?: Record<string, { type: string; optional?: boolean }>;
+  params?: Record<string, { type: string; optional?: boolean; description?: string }>;
+  /** CRUDE endpoint — required for template-only operations not in the sdef-derived schema */
+  endpoint?: "read" | "create" | "update" | "delete" | "execute";
+  /** Human-readable description for introspection */
+  description?: string;
+  /** Danger level classification */
+  danger_level?: "safe" | "reversible" | "destructive" | "dangerous";
 }
 
 export interface TemplateOverridesDocument {
