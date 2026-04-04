@@ -1,6 +1,12 @@
 import path from "node:path";
 
-import type { AdapterSchemaDocument } from "./types.js";
+import type {
+  AdapterSchemaDocument,
+  AdapterSchemaOperation,
+  CurationDocument,
+  EndpointCategory,
+  TemplateOverridesDocument,
+} from "./types.js";
 import { readJsonFile, writeJsonFile, writeTextFile } from "./shared.js";
 
 function packageName(schema: AdapterSchemaDocument): string {
@@ -79,7 +85,55 @@ npm run start
 `;
 }
 
-function buildNativeAppleScriptServerSource(schema: AdapterSchemaDocument): string {
+/**
+ * Convert a simple glob pattern (supporting only `*` wildcards) to a RegExp.
+ */
+function globToRegex(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`);
+}
+
+/**
+ * Filter schema operations according to a curation document.
+ *
+ * When `mode` is "include", only operations listed in `operations` are kept.
+ * When `mode` is "exclude", listed operations are removed.
+ * In both modes, `exclude_patterns` removes any operations whose name matches
+ * a glob pattern.
+ */
+export function applyCuration(
+  schema: AdapterSchemaDocument,
+  curation: CurationDocument,
+): AdapterSchemaDocument {
+  const includeSet = curation.operations ? new Set(curation.operations) : undefined;
+  const excludeRegexes = (curation.exclude_patterns ?? []).map(globToRegex);
+
+  function matchesExcludePattern(name: string): boolean {
+    return excludeRegexes.some((regex) => regex.test(name));
+  }
+
+  function filterOps(ops: AdapterSchemaOperation[] | undefined): AdapterSchemaOperation[] {
+    if (!ops) return [];
+    return ops.filter((op) => {
+      if (matchesExcludePattern(op.name)) return false;
+      if (curation.mode === "include" && includeSet) return includeSet.has(op.name);
+      if (curation.mode === "exclude" && includeSet) return !includeSet.has(op.name);
+      return true;
+    });
+  }
+
+  const filteredOperations: AdapterSchemaDocument["operations"] = {};
+  for (const endpoint of ["create", "read", "update", "delete", "execute"] as const) {
+    const filtered = filterOps(schema.operations[endpoint]);
+    if (filtered.length > 0) {
+      filteredOperations[endpoint] = filtered;
+    }
+  }
+
+  return { ...schema, operations: filteredOperations };
+}
+
+function buildNativeAppleScriptServerSource(schema: AdapterSchemaDocument, hasTemplates: boolean): string {
   return `import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -94,7 +148,7 @@ import type {
   ListToolsResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import rawSchema from "./schema.json" with { type: "json" };
-
+${hasTemplates ? 'import rawTemplates from "./templates.json" with { type: "json" };\n' : ""}
 const execFileAsync = promisify(execFile);
 
 type EndpointKey = "create" | "read" | "update" | "delete" | "execute";
@@ -363,8 +417,30 @@ function buildIntrospection(params: Record<string, unknown>) {
   return { success: false, error: { code: "VALIDATION_INVALID_QUERY", message: \`Unknown introspection query: \${String(params.query)}\` } };
 }
 
-async function handleNativeOperation(operationName: string, params: Record<string, unknown>) {
-  const item = TOOL_BY_OPERATION.get(operationName);
+${hasTemplates ? `type TemplateEntry = { language: string; script: string; params?: Record<string, { type: string; optional?: boolean }> };
+const templates = rawTemplates as Record<string, TemplateEntry>;
+
+function interpolateTemplate(script: string, params: Record<string, unknown>): string {
+  let result = script;
+  for (const [key, value] of Object.entries(params)) {
+    validateParamKey(key);
+    result = result.replaceAll("{{" + key + "}}", sanitizeForJxa(value));
+  }
+  return result;
+}
+
+` : ""}async function handleNativeOperation(operationName: string, params: Record<string, unknown>) {
+${hasTemplates ? `  const template = templates[operationName];
+  if (template) {
+    try {
+      const script = interpolateTemplate(template.script, params);
+      const result = await executeJxa(script);
+      return { success: true, data: result };
+    } catch (error: unknown) {
+      return { success: false, error: { code: "TRANSPORT_NATIVE_EXECUTION_ERROR", message: error instanceof Error ? error.message : String(error) } };
+    }
+  }
+` : ""}  const item = TOOL_BY_OPERATION.get(operationName);
   if (!item) return { success: false, error: { code: "NOT_FOUND_OPERATION", message: \`Unknown operation: \${operationName}\` } };
   try {
     const script = buildJxaScript(item.definition.maps_to, params);
@@ -931,14 +1007,28 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 export async function generateAdapterPackage(options: {
   schemaPath: string;
   provenancePath?: string;
+  templatesPath?: string;
+  curationPath?: string;
   outDir: string;
 }): Promise<void> {
-  const schema = await readJsonFile<AdapterSchemaDocument>(options.schemaPath);
+  let schema = await readJsonFile<AdapterSchemaDocument>(options.schemaPath);
   const provenance = options.provenancePath
     ? await readJsonFile<Record<string, unknown>>(options.provenancePath)
     : { generated_at: new Date().toISOString() };
 
   const outDir = options.outDir;
+
+  // Apply curation filtering before generation
+  if (options.curationPath) {
+    const curation = await readJsonFile<CurationDocument>(options.curationPath);
+    schema = applyCuration(schema, curation);
+  }
+
+  // Load template overrides
+  let templatesDoc: TemplateOverridesDocument | undefined;
+  if (options.templatesPath) {
+    templatesDoc = await readJsonFile<TemplateOverridesDocument>(options.templatesPath);
+  }
 
   if (schema.target.transport === "native-applescript" && !schema.target.application) {
     throw new Error("native-applescript adapter schema requires target.application");
@@ -947,8 +1037,14 @@ export async function generateAdapterPackage(options: {
   await writeJsonFile(path.join(outDir, "src/schema.json"), schema);
   await writeJsonFile(path.join(outDir, "src/provenance.json"), provenance);
 
+  // Write templates.json when template overrides are provided
+  if (templatesDoc) {
+    await writeJsonFile(path.join(outDir, "src/templates.json"), templatesDoc.templates);
+  }
+
+  const hasTemplates = templatesDoc !== undefined;
   const serverSource = schema.target.transport === "native-applescript"
-    ? buildNativeAppleScriptServerSource(schema)
+    ? buildNativeAppleScriptServerSource(schema, hasTemplates)
     : buildServerSource(schema);
 
   const dependencies: Record<string, string> = { "@modelcontextprotocol/sdk": "^1.27.1" };

@@ -155,3 +155,22 @@ export interface SchemaBuildOutput {
   };
   warnings: DiscoveryBundle["normalized_bundle"]["warnings"];
 }
+
+export interface TemplateOverride {
+  language: "JavaScript" | "AppleScript";
+  script: string;
+  params?: Record<string, { type: string; optional?: boolean }>;
+}
+
+export interface TemplateOverridesDocument {
+  schema_version: string;
+  application: string;
+  templates: Record<string, TemplateOverride>;
+}
+
+export interface CurationDocument {
+  schema_version: string;
+  mode: "include" | "exclude";
+  operations?: string[];
+  exclude_patterns?: string[];
+}

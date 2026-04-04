@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { buildSchemaFromBundle, persistSchemaBuild } from "../src/schema-builder.js";
-import { generateAdapterPackage } from "../src/generator.js";
+import { generateAdapterPackage, applyCuration } from "../src/generator.js";
 
 const require = createRequire(import.meta.url);
 const AjvCtor = require("ajv/dist/2020").default as new (options?: Record<string, unknown>) => {
@@ -772,4 +772,284 @@ test("generator throws when native-applescript schema is missing target.applicat
     }),
     /native-applescript adapter schema requires target\.application/,
   );
+});
+
+test("generator applies curation to filter operations", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-curation-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const curationPath = path.join(tempRoot, "curation.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-mail",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Mail.",
+      target: {
+        base_url: "native-applescript://Mail",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        application: "Mail",
+      },
+      operations: {
+        read: [
+          { name: "list_accounts", maps_to: "native-applescript:command:accounts", description: "List mail accounts." },
+          { name: "list_mailboxes", maps_to: "native-applescript:command:mailboxes", description: "List mailboxes." },
+          { name: "list_messages", maps_to: "native-applescript:command:messages", description: "List messages." },
+          { name: "get_message", maps_to: "native-applescript:command:getMessage", description: "Get a message." },
+          { name: "search_messages", maps_to: "native-applescript:command:search", description: "Search messages." },
+          { name: "get_rich_text_content", maps_to: "native-applescript:command:richText", description: "Get rich text." },
+          { name: "get_paragraph_count", maps_to: "native-applescript:command:paragraphs", description: "Get paragraph count." },
+          { name: "get_word_count", maps_to: "native-applescript:command:words", description: "Get word count." },
+          { name: "get_character_count", maps_to: "native-applescript:command:chars", description: "Get character count." },
+          { name: "get_attribute_run_info", maps_to: "native-applescript:command:attrRuns", description: "Get attribute runs." },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+  await writeFile(
+    curationPath,
+    JSON.stringify({
+      schema_version: "1.0",
+      mode: "include",
+      operations: ["list_accounts", "list_mailboxes", "list_messages"],
+    }),
+    "utf8",
+  );
+
+  await generateAdapterPackage({
+    schemaPath,
+    provenancePath,
+    curationPath,
+    outDir: adapterOutDir,
+  });
+
+  const generatedSchema = JSON.parse(await readFile(path.join(adapterOutDir, "src/schema.json"), "utf8")) as {
+    operations: { read?: Array<{ name: string }> };
+  };
+  const readNames = (generatedSchema.operations.read ?? []).map((op) => op.name);
+
+  assert.equal(readNames.length, 3);
+  assert.ok(readNames.includes("list_accounts"));
+  assert.ok(readNames.includes("list_mailboxes"));
+  assert.ok(readNames.includes("list_messages"));
+  assert.ok(!readNames.includes("get_rich_text_content"));
+  assert.ok(!readNames.includes("search_messages"));
+});
+
+test("generator embeds template overrides in generated server", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-templates-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const templatesPath = path.join(tempRoot, "templates.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-mail",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Mail.",
+      target: {
+        base_url: "native-applescript://Mail",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        application: "Mail",
+      },
+      operations: {
+        read: [
+          { name: "list_accounts", maps_to: "native-applescript:command:accounts", description: "List mail accounts." },
+          { name: "list_mailboxes", maps_to: "native-applescript:command:mailboxes", description: "List mailboxes." },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+  await writeFile(
+    templatesPath,
+    JSON.stringify({
+      schema_version: "1.0",
+      application: "Mail",
+      templates: {
+        list_accounts: {
+          language: "JavaScript",
+          script: "ObjC.import('stdlib');\nconst mail = Application('Mail');\nJSON.stringify(mail.accounts().map(a => ({name: a.name()})));",
+          params: {},
+        },
+        list_mailboxes: {
+          language: "JavaScript",
+          script: "ObjC.import('stdlib');\nconst mail = Application('Mail');\nconst account = mail.accounts[{{account_name}}];\nJSON.stringify(account.mailboxes().map(m => ({name: m.name()})));",
+          params: { account_name: { type: "text" } },
+        },
+      },
+    }),
+    "utf8",
+  );
+
+  await generateAdapterPackage({
+    schemaPath,
+    provenancePath,
+    templatesPath,
+    outDir: adapterOutDir,
+  });
+
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+  const templatesJson = await readFile(path.join(adapterOutDir, "src/templates.json"), "utf8");
+
+  // Verify templates.json was written
+  const parsedTemplates = JSON.parse(templatesJson) as Record<string, unknown>;
+  assert.ok("list_accounts" in parsedTemplates);
+  assert.ok("list_mailboxes" in parsedTemplates);
+
+  // Verify the generated server imports templates
+  assert.match(serverSource, /import rawTemplates from "\.\/templates\.json"/);
+
+  // Verify template dispatch infrastructure
+  assert.match(serverSource, /function interpolateTemplate/);
+  assert.match(serverSource, /const template = templates\[operationName\]/);
+  assert.match(serverSource, /interpolateTemplate\(template\.script, params\)/);
+});
+
+test("generator falls back to generic buildJxaScript when no template exists", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-template-fallback-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const templatesPath = path.join(tempRoot, "templates.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-mail",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Mail.",
+      target: {
+        base_url: "native-applescript://Mail",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        application: "Mail",
+      },
+      operations: {
+        read: [
+          { name: "list_accounts", maps_to: "native-applescript:command:accounts", description: "List mail accounts." },
+          { name: "list_mailboxes", maps_to: "native-applescript:command:mailboxes", description: "List mailboxes." },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+  // Only provide a template for list_accounts; list_mailboxes should fall back
+  await writeFile(
+    templatesPath,
+    JSON.stringify({
+      schema_version: "1.0",
+      application: "Mail",
+      templates: {
+        list_accounts: {
+          language: "JavaScript",
+          script: "ObjC.import('stdlib');\nJSON.stringify('custom');",
+          params: {},
+        },
+      },
+    }),
+    "utf8",
+  );
+
+  await generateAdapterPackage({
+    schemaPath,
+    provenancePath,
+    templatesPath,
+    outDir: adapterOutDir,
+  });
+
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+
+  // Verify template dispatch is present (for list_accounts)
+  assert.match(serverSource, /const template = templates\[operationName\]/);
+
+  // Verify the generic fallback path is also present (for list_mailboxes and others)
+  assert.match(serverSource, /const script = buildJxaScript\(item\.definition\.maps_to, params\)/);
+  assert.match(serverSource, /function buildJxaScript/);
+});
+
+test("curation exclude_patterns filters by glob", () => {
+  const schema = {
+    name: "apple-mail",
+    type: "adapter" as const,
+    version: "0.1.0",
+    description: "Generated MCP-AQL adapter for Apple Mail.",
+    target: {
+      base_url: "native-applescript://Mail",
+      transport: "native-applescript" as const,
+      protocol: "custom" as const,
+      serialization: "json" as const,
+      application: "Mail",
+    },
+    operations: {
+      read: [
+        { name: "list_accounts", maps_to: "x", description: "a" },
+        { name: "list_mailboxes", maps_to: "x", description: "b" },
+        { name: "get_rich_text_content", maps_to: "x", description: "c" },
+        { name: "get_rich_text_style", maps_to: "x", description: "d" },
+        { name: "get_paragraph_count", maps_to: "x", description: "e" },
+        { name: "get_paragraph_style", maps_to: "x", description: "f" },
+        { name: "get_word_count", maps_to: "x", description: "g" },
+        { name: "list_rich_text_items", maps_to: "x", description: "h" },
+        { name: "list_paragraph_items", maps_to: "x", description: "i" },
+        { name: "search_messages", maps_to: "x", description: "j" },
+      ],
+    },
+  };
+
+  const result = applyCuration(schema, {
+    schema_version: "1.0",
+    mode: "include",
+    operations: [
+      "list_accounts",
+      "list_mailboxes",
+      "get_rich_text_content",
+      "get_rich_text_style",
+      "get_paragraph_count",
+      "get_paragraph_style",
+      "get_word_count",
+      "list_rich_text_items",
+      "list_paragraph_items",
+      "search_messages",
+    ],
+    exclude_patterns: [
+      "get_rich_text_*",
+      "get_paragraph_*",
+      "get_word_*",
+      "list_rich_text_*",
+      "list_paragraph_*",
+    ],
+  });
+
+  const readNames = (result.operations.read ?? []).map((op) => op.name);
+
+  assert.equal(readNames.length, 3);
+  assert.ok(readNames.includes("list_accounts"));
+  assert.ok(readNames.includes("list_mailboxes"));
+  assert.ok(readNames.includes("search_messages"));
+
+  // Verify all globbed operations were removed
+  assert.ok(!readNames.includes("get_rich_text_content"));
+  assert.ok(!readNames.includes("get_rich_text_style"));
+  assert.ok(!readNames.includes("get_paragraph_count"));
+  assert.ok(!readNames.includes("get_paragraph_style"));
+  assert.ok(!readNames.includes("get_word_count"));
+  assert.ok(!readNames.includes("list_rich_text_items"));
+  assert.ok(!readNames.includes("list_paragraph_items"));
 });
