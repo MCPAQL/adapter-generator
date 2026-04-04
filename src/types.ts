@@ -114,9 +114,11 @@ export interface AdapterSchemaDocument {
   description: string;
   target: {
     base_url: string;
-    transport: "http";
+    transport: "http" | "native-applescript";
     protocol: "custom";
     serialization: "json";
+    /** The macOS application name (for native-applescript transport). */
+    application?: string;
   };
   auth?: {
     type: "bearer";

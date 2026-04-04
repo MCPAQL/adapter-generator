@@ -337,6 +337,119 @@ test("schema builder preserves param format when present in the bundle", async (
   assert.equal(rebuiltOperation?.params?.created_at?.format, "date-time");
 });
 
+test("schema builder detects native-applescript transport from source metadata", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-native-transport-"));
+  const tempBundlePath = path.join(tempRoot, "bundle.json");
+
+  await writeFile(
+    tempBundlePath,
+    JSON.stringify({
+      schema_version: "1.0.0-draft",
+      source: {
+        name: "mail-app",
+        server_url: "native-applescript://Mail",
+        server: { name: "Mail", version: "native" },
+        auth: { type: "none" },
+        capture_config_redacted: { transport: "native-applescript", application: "Mail" },
+      },
+      normalized_bundle: {
+        operations: [
+          {
+            source_tool_name: "get",
+            operation_name: "get",
+            description: "Get data from an object.",
+            endpoint: "READ",
+            endpoint_confidence: "high",
+            danger_level: "safe",
+            needs_review: false,
+            review_reasons: [],
+            params: [],
+            maps_to: "native-applescript:command:get",
+          },
+        ],
+        warnings: [],
+      },
+    }),
+    "utf8",
+  );
+
+  const output = await buildSchemaFromBundle({ bundlePath: tempBundlePath });
+  assert.equal(output.schema.target.transport, "native-applescript");
+  assert.equal(output.schema.target.application, "Mail");
+  assert.equal(output.schema.auth, undefined);
+});
+
+test("generator produces native-applescript server source", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-native-server-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-mail",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Mail.",
+      target: {
+        base_url: "native-applescript://Mail",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        application: "Mail",
+      },
+      operations: {
+        read: [
+          {
+            name: "list_accounts",
+            maps_to: "native-applescript:command:accounts",
+            description: "List mail accounts.",
+          },
+        ],
+        update: [
+          {
+            name: "set_message_read_status",
+            maps_to: "native-applescript:set_property:message.readStatus",
+            description: "Set read status of a message.",
+            params: {
+              message_specifier: { type: "string", required: true, description: "Message specifier" },
+              value: { type: "boolean", required: true, description: "New read status" },
+            },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+
+  await generateAdapterPackage({
+    schemaPath,
+    provenancePath,
+    outDir: adapterOutDir,
+  });
+
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+  const readme = await readFile(path.join(adapterOutDir, "README.md"), "utf8");
+
+  // Verify native transport-specific code
+  assert.match(serverSource, /osascript/);
+  assert.match(serverSource, /execFile/);
+  assert.match(serverSource, /buildJxaScript/);
+  assert.match(serverSource, /sanitizeForJxa/);
+  assert.match(serverSource, /operation === "introspect"/);
+  assert.match(serverSource, /mcp_aql_read/);
+
+  // Verify it does NOT contain upstream HTTP client code
+  assert.ok(!serverSource.includes("StreamableHTTPClientTransport"));
+  assert.ok(!serverSource.includes("resolveToken"));
+
+  // Verify README mentions native transport
+  assert.match(readme, /osascript/);
+  assert.match(readme, /Mail/);
+});
+
 test("schema builder prefers source_tool_name overrides when both override keys are present", async () => {
   const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-override-precedence-"));
   const precedenceOverridesPath = path.join(tempRoot, "overrides.json");
@@ -383,4 +496,280 @@ test("schema builder prefers source_tool_name overrides when both override keys 
   );
   assert.ok(rebuiltMetadata?.review_reasons.includes("source_tool_name override should win"));
   assert.ok(!rebuiltMetadata?.review_reasons.includes("operation_name override should lose to source_tool_name"));
+});
+
+test("generated native-applescript source contains JXA security validation helpers", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-jxa-security-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-notes",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Notes.",
+      target: {
+        base_url: "native-applescript://Notes",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        application: "Notes",
+      },
+      operations: {
+        read: [
+          {
+            name: "list_notes",
+            maps_to: "native-applescript:command:notes",
+            description: "List all notes.",
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+
+  await generateAdapterPackage({
+    schemaPath,
+    provenancePath,
+    outDir: adapterOutDir,
+  });
+
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+
+  // Verify the three security helpers are present in the generated source
+  assert.match(serverSource, /function validateParamKey\(key: string\): string/);
+  assert.match(serverSource, /function validateJxaIdentifier\(value: string, label: string\): string/);
+  assert.match(serverSource, /function sanitizeForJxa\(value: unknown\): string/);
+
+  // Verify the validation regex patterns reject adversarial inputs
+  // validateParamKey uses ^[a-zA-Z_][\w]*$ — rejects keys with special chars
+  assert.match(serverSource, /\/\^\[a-zA-Z_\]\[\\w\]\*\$\//);
+  // validateJxaIdentifier uses ^[a-zA-Z_][\w.]*$ — rejects identifiers with injection chars
+  assert.match(serverSource, /\/\^\[a-zA-Z_\]\[\\w\.\]\*\$\//);
+  // sanitizeForJxa uses JSON.stringify for string escaping
+  assert.match(serverSource, /JSON\.stringify\(value\)/);
+});
+
+test("validateParamKey rejects injection attempts in generated source", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-paramkey-behavioral-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-notes",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Notes.",
+      target: {
+        base_url: "native-applescript://Notes",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        application: "Notes",
+      },
+      operations: {
+        read: [{ name: "list_notes", maps_to: "native-applescript:command:notes", description: "List all notes." }],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+
+  await generateAdapterPackage({ schemaPath, provenancePath, outDir: adapterOutDir });
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+
+  // Extract validateParamKey from generated source and execute it
+  const fnMatch = serverSource.match(/function validateParamKey[\s\S]*?\n\}/);
+  assert.ok(fnMatch, "validateParamKey found in generated source");
+  // Remove TypeScript type annotations so it runs as plain JS
+  const jsBody = fnMatch[0].replace(/\(key: string\): string/, "(key)");
+  const fn = new Function(`${jsBody}; return validateParamKey;`)() as (key: string) => string;
+
+  // Should accept valid keys
+  assert.doesNotThrow(() => fn("query"));
+  assert.doesNotThrow(() => fn("owner"));
+  assert.doesNotThrow(() => fn("pull_number"));
+  assert.doesNotThrow(() => fn("_private"));
+  assert.doesNotThrow(() => fn("camelCase123"));
+
+  // Should reject injection attempts
+  assert.throws(() => fn("}); evil("), /Invalid param/i);
+  assert.throws(() => fn("key;drop"), /Invalid param/i);
+  assert.throws(() => fn(""), /Invalid param/i);
+  assert.throws(() => fn("123start"), /Invalid param/i);
+  assert.throws(() => fn("has space"), /Invalid param/i);
+  assert.throws(() => fn("a.b"), /Invalid param/i);
+});
+
+test("validateJxaIdentifier rejects injection attempts in generated source", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-jxaid-behavioral-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-notes",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Notes.",
+      target: {
+        base_url: "native-applescript://Notes",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        application: "Notes",
+      },
+      operations: {
+        read: [{ name: "list_notes", maps_to: "native-applescript:command:notes", description: "List all notes." }],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+
+  await generateAdapterPackage({ schemaPath, provenancePath, outDir: adapterOutDir });
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+
+  // Extract validateJxaIdentifier from generated source and execute it
+  const fnMatch = serverSource.match(/function validateJxaIdentifier[\s\S]*?\n\}/);
+  assert.ok(fnMatch, "validateJxaIdentifier found in generated source");
+  const jsBody = fnMatch[0].replace(/\(value: string, label: string\): string/, "(value, label)");
+  const fn = new Function(`${jsBody}; return validateJxaIdentifier;`)() as (value: string, label: string) => string;
+
+  // Should accept valid identifiers (including dotted paths)
+  assert.doesNotThrow(() => fn("messages", "test"));
+  assert.doesNotThrow(() => fn("account.name", "test"));
+  assert.doesNotThrow(() => fn("_internal", "test"));
+  assert.doesNotThrow(() => fn("foo123", "test"));
+
+  // Should reject injection attempts
+  assert.throws(() => fn("foo;bar", "test"), /Invalid/i);
+  assert.throws(() => fn("x()", "test"), /Invalid/i);
+  assert.throws(() => fn("a`b", "test"), /Invalid/i);
+  assert.throws(() => fn("", "test"), /Invalid/i);
+  assert.throws(() => fn("123start", "test"), /Invalid/i);
+  assert.throws(() => fn("a b", "test"), /Invalid/i);
+});
+
+test("sanitizeForJxa escapes dangerous values in generated source", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-sanitize-behavioral-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-notes",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Notes.",
+      target: {
+        base_url: "native-applescript://Notes",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        application: "Notes",
+      },
+      operations: {
+        read: [{ name: "list_notes", maps_to: "native-applescript:command:notes", description: "List all notes." }],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+
+  await generateAdapterPackage({ schemaPath, provenancePath, outDir: adapterOutDir });
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+
+  // Extract sanitizeForJxa from generated source and execute it
+  const fnMatch = serverSource.match(/function sanitizeForJxa[\s\S]*?\n\}/);
+  assert.ok(fnMatch, "sanitizeForJxa found in generated source");
+  const jsBody = fnMatch[0].replace(/\(value: unknown\): string/, "(value)");
+  const fn = new Function(`${jsBody}; return sanitizeForJxa;`)() as (value: unknown) => string;
+
+  // Should handle strings safely via JSON.stringify
+  const result = fn('value with "quotes" and \\injection');
+  assert.ok(result.startsWith('"'), "string result is JSON-quoted");
+  assert.ok(result.includes('\\"'), "double quotes are escaped");
+  assert.ok(result.includes("\\\\"), "backslashes are escaped");
+
+  // Should handle numbers
+  assert.strictEqual(fn(42), "42");
+  assert.strictEqual(fn(0), "0");
+  assert.strictEqual(fn(-3.14), "-3.14");
+
+  // Should reject non-finite numbers
+  assert.throws(() => fn(Infinity), /Non-finite/);
+  assert.throws(() => fn(NaN), /Non-finite/);
+
+  // Should handle booleans
+  assert.strictEqual(fn(true), "true");
+  assert.strictEqual(fn(false), "false");
+
+  // Should handle null/undefined
+  assert.strictEqual(fn(null), "null");
+  assert.strictEqual(fn(undefined), "null");
+
+  // Should handle objects via JSON
+  const objResult = fn({ key: "value" });
+  assert.ok(objResult.includes("key"), "object serialized");
+  assert.ok(objResult.includes("value"), "object values present");
+
+  // Should handle arrays via JSON
+  const arrResult = fn([1, 2, 3]);
+  assert.ok(arrResult.includes("1"), "array serialized");
+});
+
+test("generator throws when native-applescript schema is missing target.application", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-generator-missing-app-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "apple-mail",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Generated MCP-AQL adapter for Apple Mail.",
+      target: {
+        base_url: "native-applescript://Mail",
+        transport: "native-applescript",
+        protocol: "custom",
+        serialization: "json",
+        // deliberately omit application
+      },
+      operations: {
+        read: [
+          {
+            name: "list_accounts",
+            maps_to: "native-applescript:command:accounts",
+            description: "List mail accounts.",
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(provenancePath, JSON.stringify({ generated_at: new Date().toISOString() }), "utf8");
+
+  await assert.rejects(
+    generateAdapterPackage({
+      schemaPath,
+      provenancePath,
+      outDir: adapterOutDir,
+    }),
+    /native-applescript adapter schema requires target\.application/,
+  );
 });

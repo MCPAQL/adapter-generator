@@ -125,6 +125,15 @@ export async function buildSchemaFromBundle(options: {
   const adapterName = overrides?.adapter?.name ?? `${bundle.source.name}-adapter`;
   const tokenEnv = overrides?.adapter?.token_env ?? bundle.source.auth.token_env;
 
+  // Detect native-applescript transport from source metadata
+  const captureConfig = bundle.source.capture_config_redacted as Record<string, unknown> | undefined;
+  const isNativeTransport = captureConfig?.transport === "native-applescript"
+    || bundle.source.server_url.startsWith("native-applescript://");
+  const transport: "http" | "native-applescript" = isNativeTransport ? "native-applescript" : "http";
+  const application = isNativeTransport
+    ? (captureConfig?.application as string | undefined) ?? bundle.source.server?.name
+    : undefined;
+
   const schema: AdapterSchemaDocument = {
     name: adapterName,
     type: "adapter",
@@ -134,9 +143,10 @@ export async function buildSchemaFromBundle(options: {
       `Generated MCP-AQL adapter for ${bundle.source.server?.title ?? bundle.source.name}.`,
     target: {
       base_url: bundle.source.server_url.replace(/\/$/, ""),
-      transport: "http",
+      transport,
       protocol: "custom",
       serialization: "json",
+      ...(application ? { application } : {}),
     },
     auth:
       bundle.source.auth.type === "bearer"
