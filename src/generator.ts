@@ -483,6 +483,7 @@ type AdapterSchema = {
     prefix?: string;
     token_env?: string;
   };
+  headers?: Record<string, string>;
   operations: Partial<Record<EndpointKey, OperationDefinition[]>>;
 };
 type OperationIndexEntry = {
@@ -566,9 +567,10 @@ async function getUpstreamClient(): Promise<Client> {
     return upstreamClient;
   }
 
-  const headers: Record<string, string> = {
-    ...((schema as { headers?: Record<string, string> }).headers ?? {}),
-  };
+  // Discovery-time headers (e.g., toolset selectors) merged first, then the bearer
+  // auth header set last — so any accidental Authorization key in the captured
+  // headers can't override the live token.
+  const headers: Record<string, string> = { ...(schema.headers ?? {}) };
   if (schema.auth?.type === "bearer") {
     headers[schema.auth.header ?? "Authorization"] = \`\${schema.auth.prefix ?? "Bearer "}\${resolveToken()}\`;
   }

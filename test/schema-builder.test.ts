@@ -87,7 +87,7 @@ test("schema builder propagates custom discovery headers into the adapter schema
             source_tool_name: "list_things",
             operation_name: "list_things",
             description: "List things",
-            endpoint: "read",
+            endpoint: "READ",
             endpoint_confidence: "high",
             danger_level: "safe",
             needs_review: false,
@@ -109,6 +109,70 @@ test("schema builder omits headers field when discovery bundle has none", async 
   // Standard captures without custom headers should not introduce a headers field
   // (keeps generated schemas minimal and the absence semantically meaningful).
   const output = await buildSchemaFromBundle({ bundlePath, overridesPath });
+  assert.equal(output.schema.headers, undefined);
+});
+
+test("schema builder drops non-string header values silently", async () => {
+  // Defensive: capture configs are free-form. If a non-string slips into the headers
+  // record (e.g., a number from a buggy upstream config), the builder must filter it
+  // out rather than crash or pass it through — HTTP headers are string-valued.
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-headers-mixed-"));
+  const syntheticBundlePath = path.join(tempRoot, "discovery-bundle.json");
+  await writeFile(
+    syntheticBundlePath,
+    JSON.stringify({
+      schema_version: "1.0.0-draft",
+      source: {
+        name: "mixed-headers",
+        server_url: "https://example.com/mcp/",
+        auth: { type: "bearer", token_env: "FIXTURE_TOKEN" },
+        capture_config_redacted: {
+          transport: "streamable_http",
+          headers: { "X-Keep": "yes", "X-Drop-Number": 42, "X-Drop-Bool": true, "X-Drop-Null": null },
+        },
+      },
+      normalized_bundle: {
+        operations: [{
+          source_tool_name: "list_things", operation_name: "list_things",
+          description: "List things", endpoint: "READ", endpoint_confidence: "high",
+          danger_level: "safe", needs_review: false, review_reasons: [], params: [],
+          maps_to: "tool:list_things",
+        }],
+        warnings: [],
+      },
+    }),
+  );
+  const output = await buildSchemaFromBundle({ bundlePath: syntheticBundlePath });
+  assert.deepEqual(output.schema.headers, { "X-Keep": "yes" });
+});
+
+test("schema builder omits headers field for empty headers object", async () => {
+  // An empty `headers: {}` in the capture should produce the same shape as no headers
+  // at all — no `headers` key on the generated schema.
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-headers-empty-"));
+  const syntheticBundlePath = path.join(tempRoot, "discovery-bundle.json");
+  await writeFile(
+    syntheticBundlePath,
+    JSON.stringify({
+      schema_version: "1.0.0-draft",
+      source: {
+        name: "empty-headers",
+        server_url: "https://example.com/mcp/",
+        auth: { type: "bearer", token_env: "FIXTURE_TOKEN" },
+        capture_config_redacted: { transport: "streamable_http", headers: {} },
+      },
+      normalized_bundle: {
+        operations: [{
+          source_tool_name: "list_things", operation_name: "list_things",
+          description: "List things", endpoint: "READ", endpoint_confidence: "high",
+          danger_level: "safe", needs_review: false, review_reasons: [], params: [],
+          maps_to: "tool:list_things",
+        }],
+        warnings: [],
+      },
+    }),
+  );
+  const output = await buildSchemaFromBundle({ bundlePath: syntheticBundlePath });
   assert.equal(output.schema.headers, undefined);
 });
 
@@ -143,8 +207,11 @@ test("generator forwards adapter schema headers to upstream", async () => {
   // The emitted client builds a headers object from schema.headers and merges in
   // the bearer auth. Both must be present in the source for the upstream call
   // to carry the discovery-time selector header.
-  assert.match(serverSource, /\.\.\.\(\(schema as \{ headers\?: Record<string, string> \}\)\.headers \?\? \{\}\)/);
+  assert.match(serverSource, /\.\.\.\(schema\.headers \?\? \{\}\)/);
   assert.match(serverSource, /schema\.auth\.header \?\? "Authorization"/);
+  // Embedded AdapterSchema type in the generated source must include `headers`
+  // so the clean `schema.headers` access type-checks without a cast.
+  assert.match(serverSource, /headers\?: Record<string, string>/);
 
   // The bundled schema.json in the generated package must carry the headers field through.
   const generatedSchema = JSON.parse(
