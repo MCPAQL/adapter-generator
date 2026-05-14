@@ -483,6 +483,7 @@ type AdapterSchema = {
     prefix?: string;
     token_env?: string;
   };
+  headers?: Record<string, string>;
   operations: Partial<Record<EndpointKey, OperationDefinition[]>>;
 };
 type OperationIndexEntry = {
@@ -566,14 +567,26 @@ async function getUpstreamClient(): Promise<Client> {
     return upstreamClient;
   }
 
+  // Carry discovery-time headers (e.g., toolset selectors) and add the live bearer
+  // token. HTTP header names are case-insensitive, and some Fetch implementations
+  // combine duplicate-name-different-case headers with commas, so we must drop any
+  // captured header whose name case-insensitively matches the configured auth header
+  // before adding the live token. Without this, a bundle containing a lowercase
+  // authorization key (e.g., from a lower-casing HTTP client) would land alongside
+  // the live Authorization header and produce a malformed combined value upstream.
+  const authHeaderName = schema.auth?.header ?? "Authorization";
+  const authHeaderLower = authHeaderName.toLowerCase();
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(schema.headers ?? {})) {
+    if (name.toLowerCase() === authHeaderLower) continue;
+    headers[name] = value;
+  }
+  if (schema.auth?.type === "bearer") {
+    headers[authHeaderName] = \`\${schema.auth.prefix ?? "Bearer "}\${resolveToken()}\`;
+  }
   const transport = new StreamableHTTPClientTransport(new URL(resolveBaseUrl()), {
     requestInit: {
-      headers:
-        schema.auth?.type === "bearer"
-          ? {
-              Authorization: \`\${schema.auth.prefix ?? "Bearer "}\${resolveToken()}\`,
-            }
-          : undefined,
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
     },
   });
   const client = new Client({ name: schema.name, version: schema.version });

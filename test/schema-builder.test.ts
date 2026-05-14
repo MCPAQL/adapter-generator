@@ -63,6 +63,256 @@ test("schema builder emits spec-valid adapter schema with github overrides appli
   assert.equal(addCommentToPendingReviewOperation?.param_mappings?.pull_number, "pullNumber");
 });
 
+test("schema builder propagates custom discovery headers into the adapter schema", async () => {
+  // Build a synthetic discovery bundle that carries a custom toolset-selector header,
+  // mimicking what mcpaql-interrogate would write for `X-MCP-Toolsets: all` style captures.
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-headers-bundle-"));
+  const syntheticBundlePath = path.join(tempRoot, "discovery-bundle.json");
+  await writeFile(
+    syntheticBundlePath,
+    JSON.stringify({
+      schema_version: "1.0.0-draft",
+      source: {
+        name: "headers-fixture",
+        server_url: "https://example.com/mcp/",
+        auth: { type: "bearer", token_env: "FIXTURE_TOKEN" },
+        capture_config_redacted: {
+          transport: "streamable_http",
+          headers: { "X-Custom-Selector": "all", "X-Tenant": "test" },
+        },
+      },
+      normalized_bundle: {
+        operations: [
+          {
+            source_tool_name: "list_things",
+            operation_name: "list_things",
+            description: "List things",
+            endpoint: "READ",
+            endpoint_confidence: "high",
+            danger_level: "safe",
+            needs_review: false,
+            review_reasons: [],
+            params: [],
+            maps_to: "tool:list_things",
+          },
+        ],
+        warnings: [],
+      },
+    }),
+  );
+
+  const output = await buildSchemaFromBundle({ bundlePath: syntheticBundlePath });
+  assert.deepEqual(output.schema.headers, { "X-Custom-Selector": "all", "X-Tenant": "test" });
+});
+
+test("schema builder omits headers field when discovery bundle has none", async () => {
+  // Standard captures without custom headers should not introduce a headers field
+  // (keeps generated schemas minimal and the absence semantically meaningful).
+  const output = await buildSchemaFromBundle({ bundlePath, overridesPath });
+  assert.equal(output.schema.headers, undefined);
+});
+
+test("schema builder drops non-string header values silently", async () => {
+  // Defensive: capture configs are free-form. If a non-string slips into the headers
+  // record (e.g., a number from a buggy upstream config), the builder must filter it
+  // out rather than crash or pass it through — HTTP headers are string-valued.
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-headers-mixed-"));
+  const syntheticBundlePath = path.join(tempRoot, "discovery-bundle.json");
+  await writeFile(
+    syntheticBundlePath,
+    JSON.stringify({
+      schema_version: "1.0.0-draft",
+      source: {
+        name: "mixed-headers",
+        server_url: "https://example.com/mcp/",
+        auth: { type: "bearer", token_env: "FIXTURE_TOKEN" },
+        capture_config_redacted: {
+          transport: "streamable_http",
+          headers: { "X-Keep": "yes", "X-Drop-Number": 42, "X-Drop-Bool": true, "X-Drop-Null": null },
+        },
+      },
+      normalized_bundle: {
+        operations: [{
+          source_tool_name: "list_things", operation_name: "list_things",
+          description: "List things", endpoint: "READ", endpoint_confidence: "high",
+          danger_level: "safe", needs_review: false, review_reasons: [], params: [],
+          maps_to: "tool:list_things",
+        }],
+        warnings: [],
+      },
+    }),
+  );
+  const output = await buildSchemaFromBundle({ bundlePath: syntheticBundlePath });
+  assert.deepEqual(output.schema.headers, { "X-Keep": "yes" });
+});
+
+test("generator drops captured headers that collide case-insensitively with the auth header", async () => {
+  // Codex review finding: HTTP header names are case-insensitive, and some Fetch
+  // implementations combine duplicate-name-different-case headers with commas. So
+  // if a discovery bundle includes `authorization` (e.g., from a lower-casing HTTP
+  // client) the generated client must drop it before setting the live `Authorization`
+  // bearer, or upstream gets a malformed combined value.
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-header-collision-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "collision-adapter",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Synthetic adapter to verify case-insensitive auth-header filtering.",
+      target: { base_url: "https://example.com/mcp", transport: "http", protocol: "custom", serialization: "json" },
+      auth: { type: "bearer", header: "Authorization", prefix: "Bearer ", token_env: "FIXTURE_TOKEN" },
+      headers: { "X-Selector": "all", "authorization": "redacted" },
+      operations: { read: [{ name: "list_things", maps_to: "tool:list_things", description: "List things" }] },
+    }),
+  );
+  await writeFile(provenancePath, JSON.stringify({ operations: [{ operation_name: "list_things", endpoint: "READ" }] }));
+
+  await generateAdapterPackage({ schemaPath, provenancePath, outDir: adapterOutDir });
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+
+  // The emitted client must contain the case-insensitive skip-on-match guard before
+  // it sets the live bearer header, otherwise both keys end up in the headers map.
+  assert.match(serverSource, /name\.toLowerCase\(\) === authHeaderLower/);
+  // And the comment explaining the invariant should be present so future maintainers
+  // know the filter is load-bearing for HTTP-header-case correctness, not stylistic.
+  assert.match(serverSource, /HTTP header names are case-insensitive/);
+
+  // The bundled schema.json must round-trip BOTH headers — the filter runs at adapter
+  // runtime, not at generation time. The intent is that future regeneration always
+  // sees what was captured; only the runtime upstream call drops the colliding key.
+  const generatedSchema = JSON.parse(
+    await readFile(path.join(adapterOutDir, "src/schema.json"), "utf8"),
+  ) as { headers?: Record<string, string> };
+  assert.deepEqual(generatedSchema.headers, { "X-Selector": "all", "authorization": "redacted" });
+});
+
+test("generator filter uses configured auth header name, not a hardcoded 'Authorization'", async () => {
+  // The filter reads `schema.auth?.header`, which means an adapter configured with
+  // a non-default auth header (e.g., GitHub-style "X-API-Key") must filter on that
+  // name. This is the test that distinguishes "schema.auth?.header is read" from
+  // "Authorization is hardcoded" — both regexes would pass the previous test.
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-custom-auth-header-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "custom-auth-adapter",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Synthetic adapter verifying configured auth header name is honored by the filter.",
+      target: { base_url: "https://example.com/mcp", transport: "http", protocol: "custom", serialization: "json" },
+      auth: { type: "bearer", header: "X-API-Key", prefix: "", token_env: "FIXTURE_TOKEN" },
+      headers: { "X-Selector": "all", "x-api-key": "redacted", "Authorization": "should-survive-no-collision" },
+      operations: { read: [{ name: "list_things", maps_to: "tool:list_things", description: "List things" }] },
+    }),
+  );
+  await writeFile(provenancePath, JSON.stringify({ operations: [{ operation_name: "list_things", endpoint: "READ" }] }));
+
+  await generateAdapterPackage({ schemaPath, provenancePath, outDir: adapterOutDir });
+
+  // Bundled schema preserves all captured headers — the runtime filter operates on
+  // the live auth-header name (`X-API-Key`), so `x-api-key` collides, but the
+  // unrelated `Authorization` value is just data and must pass through unfiltered.
+  const generatedSchema = JSON.parse(
+    await readFile(path.join(adapterOutDir, "src/schema.json"), "utf8"),
+  ) as { auth?: { header?: string }; headers?: Record<string, string> };
+  assert.equal(generatedSchema.auth?.header, "X-API-Key");
+  assert.deepEqual(generatedSchema.headers, {
+    "X-Selector": "all",
+    "x-api-key": "redacted",
+    "Authorization": "should-survive-no-collision",
+  });
+
+  // The emitted source must compute authHeaderLower from schema.auth?.header.
+  // If it hardcoded "Authorization", `x-api-key` would survive the filter and
+  // collide with the live X-API-Key value at upstream-call time.
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+  assert.match(serverSource, /const authHeaderName = schema\.auth\?\.header \?\? "Authorization"/);
+  assert.match(serverSource, /const authHeaderLower = authHeaderName\.toLowerCase\(\)/);
+});
+
+test("schema builder omits headers field for empty headers object", async () => {
+  // An empty `headers: {}` in the capture should produce the same shape as no headers
+  // at all — no `headers` key on the generated schema.
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-headers-empty-"));
+  const syntheticBundlePath = path.join(tempRoot, "discovery-bundle.json");
+  await writeFile(
+    syntheticBundlePath,
+    JSON.stringify({
+      schema_version: "1.0.0-draft",
+      source: {
+        name: "empty-headers",
+        server_url: "https://example.com/mcp/",
+        auth: { type: "bearer", token_env: "FIXTURE_TOKEN" },
+        capture_config_redacted: { transport: "streamable_http", headers: {} },
+      },
+      normalized_bundle: {
+        operations: [{
+          source_tool_name: "list_things", operation_name: "list_things",
+          description: "List things", endpoint: "READ", endpoint_confidence: "high",
+          danger_level: "safe", needs_review: false, review_reasons: [], params: [],
+          maps_to: "tool:list_things",
+        }],
+        warnings: [],
+      },
+    }),
+  );
+  const output = await buildSchemaFromBundle({ bundlePath: syntheticBundlePath });
+  assert.equal(output.schema.headers, undefined);
+});
+
+test("generator forwards adapter schema headers to upstream", async () => {
+  // Build a synthetic schema with a custom header and confirm the generated
+  // server.ts wires it into the upstream StreamableHTTPClientTransport request init.
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-headers-gen-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "headers-adapter",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Synthetic adapter to verify header forwarding.",
+      target: { base_url: "https://example.com/mcp", transport: "http", protocol: "custom", serialization: "json" },
+      auth: { type: "bearer", header: "Authorization", prefix: "Bearer ", token_env: "FIXTURE_TOKEN" },
+      headers: { "X-Custom-Selector": "all" },
+      operations: {
+        read: [{ name: "list_things", maps_to: "tool:list_things", description: "List things" }],
+      },
+    }),
+  );
+  await writeFile(provenancePath, JSON.stringify({ operations: [{ operation_name: "list_things", endpoint: "READ" }] }));
+
+  await generateAdapterPackage({ schemaPath, provenancePath, outDir: adapterOutDir });
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+
+  // The emitted client iterates schema.headers and merges in the bearer auth.
+  // Both must be present in the source for the upstream call to carry the
+  // discovery-time selector header.
+  assert.match(serverSource, /Object\.entries\(schema\.headers \?\? \{\}\)/);
+  assert.match(serverSource, /schema\.auth\?\.header \?\? "Authorization"/);
+  // Embedded AdapterSchema type in the generated source must include `headers`
+  // so the schema.headers access type-checks without a cast.
+  assert.match(serverSource, /headers\?: Record<string, string>/);
+
+  // The bundled schema.json in the generated package must carry the headers field through.
+  const generatedSchema = JSON.parse(
+    await readFile(path.join(adapterOutDir, "src/schema.json"), "utf8"),
+  ) as { headers?: Record<string, string> };
+  assert.deepEqual(generatedSchema.headers, { "X-Custom-Selector": "all" });
+});
+
 test("generator writes runnable adapter package inputs", async () => {
   const output = await buildSchemaFromBundle({
     bundlePath,
