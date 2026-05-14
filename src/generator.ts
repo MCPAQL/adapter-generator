@@ -566,14 +566,15 @@ async function getUpstreamClient(): Promise<Client> {
     return upstreamClient;
   }
 
+  const headers: Record<string, string> = {
+    ...((schema as { headers?: Record<string, string> }).headers ?? {}),
+  };
+  if (schema.auth?.type === "bearer") {
+    headers[schema.auth.header ?? "Authorization"] = \`\${schema.auth.prefix ?? "Bearer "}\${resolveToken()}\`;
+  }
   const transport = new StreamableHTTPClientTransport(new URL(resolveBaseUrl()), {
     requestInit: {
-      headers:
-        schema.auth?.type === "bearer"
-          ? {
-              Authorization: \`\${schema.auth.prefix ?? "Bearer "}\${resolveToken()}\`,
-            }
-          : undefined,
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
     },
   });
   const client = new Client({ name: schema.name, version: schema.version });

@@ -45,6 +45,12 @@ export interface DiscoveryBundle {
       type: "bearer" | "none";
       token_env?: string;
     };
+    /**
+     * The redacted capture config used by mcpaql-interrogate. Contains transport,
+     * application (for native transports), headers, etc. Schemas of inner fields
+     * vary by transport, so this is a free-form record.
+     */
+    capture_config_redacted?: Record<string, unknown>;
   };
   normalized_bundle: {
     operations: DiscoveryOperation[];
@@ -126,6 +132,15 @@ export interface AdapterSchemaDocument {
     prefix: "Bearer ";
     token_env?: string;
   };
+  /**
+   * Extra HTTP headers captured at discovery time (e.g., toolset selectors, region
+   * selectors, tenant selectors). The generated adapter forwards these to upstream
+   * on every request so it can reach the same tool surface the discovery saw.
+   *
+   * Populated from `bundle.source.capture_config_redacted.headers` by the schema
+   * builder; secrets are excluded by the redaction performed during interrogation.
+   */
+  headers?: Record<string, string>;
   operations: {
     create?: AdapterSchemaOperation[];
     read: AdapterSchemaOperation[];

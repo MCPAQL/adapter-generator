@@ -126,13 +126,25 @@ export async function buildSchemaFromBundle(options: {
   const tokenEnv = overrides?.adapter?.token_env ?? bundle.source.auth.token_env;
 
   // Detect native-applescript transport from source metadata
-  const captureConfig = bundle.source.capture_config_redacted as Record<string, unknown> | undefined;
+  const captureConfig = bundle.source.capture_config_redacted;
   const isNativeTransport = captureConfig?.transport === "native-applescript"
     || bundle.source.server_url.startsWith("native-applescript://");
   const transport: "http" | "native-applescript" = isNativeTransport ? "native-applescript" : "http";
   const application = isNativeTransport
     ? (captureConfig?.application as string | undefined) ?? bundle.source.server?.name
     : undefined;
+
+  // Carry custom discovery-time headers (e.g., X-MCP-Toolsets) through to the generated
+  // adapter so it can reach the same tool surface the discovery captured. The redaction
+  // in `capture_config_redacted` already excludes secret values.
+  const capturedHeaders = captureConfig?.headers;
+  const headers: Record<string, string> | undefined =
+    capturedHeaders && typeof capturedHeaders === "object" && !Array.isArray(capturedHeaders)
+      ? Object.fromEntries(
+          Object.entries(capturedHeaders as Record<string, unknown>)
+            .filter(([, v]) => typeof v === "string"),
+        ) as Record<string, string>
+      : undefined;
 
   const schema: AdapterSchemaDocument = {
     name: adapterName,
@@ -157,6 +169,7 @@ export async function buildSchemaFromBundle(options: {
             token_env: tokenEnv,
           }
         : undefined,
+    ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
     operations: {
       read: [],
     },
