@@ -181,6 +181,62 @@ test("generator drops captured headers that collide case-insensitively with the 
   // And the comment explaining the invariant should be present so future maintainers
   // know the filter is load-bearing for HTTP-header-case correctness, not stylistic.
   assert.match(serverSource, /HTTP header names are case-insensitive/);
+
+  // The bundled schema.json must round-trip BOTH headers — the filter runs at adapter
+  // runtime, not at generation time. The intent is that future regeneration always
+  // sees what was captured; only the runtime upstream call drops the colliding key.
+  const generatedSchema = JSON.parse(
+    await readFile(path.join(adapterOutDir, "src/schema.json"), "utf8"),
+  ) as { headers?: Record<string, string> };
+  assert.deepEqual(generatedSchema.headers, { "X-Selector": "all", "authorization": "redacted" });
+});
+
+test("generator filter uses configured auth header name, not a hardcoded 'Authorization'", async () => {
+  // The filter reads `schema.auth?.header`, which means an adapter configured with
+  // a non-default auth header (e.g., GitHub-style "X-API-Key") must filter on that
+  // name. This is the test that distinguishes "schema.auth?.header is read" from
+  // "Authorization is hardcoded" — both regexes would pass the previous test.
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-custom-auth-header-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "custom-auth-adapter",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Synthetic adapter verifying configured auth header name is honored by the filter.",
+      target: { base_url: "https://example.com/mcp", transport: "http", protocol: "custom", serialization: "json" },
+      auth: { type: "bearer", header: "X-API-Key", prefix: "", token_env: "FIXTURE_TOKEN" },
+      headers: { "X-Selector": "all", "x-api-key": "redacted", "Authorization": "should-survive-no-collision" },
+      operations: { read: [{ name: "list_things", maps_to: "tool:list_things", description: "List things" }] },
+    }),
+  );
+  await writeFile(provenancePath, JSON.stringify({ operations: [{ operation_name: "list_things", endpoint: "READ" }] }));
+
+  await generateAdapterPackage({ schemaPath, provenancePath, outDir: adapterOutDir });
+
+  // Bundled schema preserves all captured headers — the runtime filter operates on
+  // the live auth-header name (`X-API-Key`), so `x-api-key` collides, but the
+  // unrelated `Authorization` value is just data and must pass through unfiltered.
+  const generatedSchema = JSON.parse(
+    await readFile(path.join(adapterOutDir, "src/schema.json"), "utf8"),
+  ) as { auth?: { header?: string }; headers?: Record<string, string> };
+  assert.equal(generatedSchema.auth?.header, "X-API-Key");
+  assert.deepEqual(generatedSchema.headers, {
+    "X-Selector": "all",
+    "x-api-key": "redacted",
+    "Authorization": "should-survive-no-collision",
+  });
+
+  // The emitted source must compute authHeaderLower from schema.auth?.header.
+  // If it hardcoded "Authorization", `x-api-key` would survive the filter and
+  // collide with the live X-API-Key value at upstream-call time.
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+  assert.match(serverSource, /const authHeaderName = schema\.auth\?\.header \?\? "Authorization"/);
+  assert.match(serverSource, /const authHeaderLower = authHeaderName\.toLowerCase\(\)/);
 });
 
 test("schema builder omits headers field for empty headers object", async () => {
