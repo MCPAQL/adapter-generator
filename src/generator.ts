@@ -567,12 +567,22 @@ async function getUpstreamClient(): Promise<Client> {
     return upstreamClient;
   }
 
-  // Discovery-time headers (e.g., toolset selectors) merged first, then the bearer
-  // auth header set last — so any accidental Authorization key in the captured
-  // headers can't override the live token.
-  const headers: Record<string, string> = { ...(schema.headers ?? {}) };
+  // Carry discovery-time headers (e.g., toolset selectors) and add the live bearer
+  // token. HTTP header names are case-insensitive, and some Fetch implementations
+  // combine duplicate-name-different-case headers with commas, so we must drop any
+  // captured header whose name case-insensitively matches the configured auth header
+  // before adding the live token. Without this, a bundle containing a lowercase
+  // authorization key (e.g., from a lower-casing HTTP client) would land alongside
+  // the live Authorization header and produce a malformed combined value upstream.
+  const authHeaderName = schema.auth?.header ?? "Authorization";
+  const authHeaderLower = authHeaderName.toLowerCase();
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(schema.headers ?? {})) {
+    if (name.toLowerCase() === authHeaderLower) continue;
+    headers[name] = value;
+  }
   if (schema.auth?.type === "bearer") {
-    headers[schema.auth.header ?? "Authorization"] = \`\${schema.auth.prefix ?? "Bearer "}\${resolveToken()}\`;
+    headers[authHeaderName] = \`\${schema.auth.prefix ?? "Bearer "}\${resolveToken()}\`;
   }
   const transport = new StreamableHTTPClientTransport(new URL(resolveBaseUrl()), {
     requestInit: {

@@ -146,6 +146,43 @@ test("schema builder drops non-string header values silently", async () => {
   assert.deepEqual(output.schema.headers, { "X-Keep": "yes" });
 });
 
+test("generator drops captured headers that collide case-insensitively with the auth header", async () => {
+  // Codex review finding: HTTP header names are case-insensitive, and some Fetch
+  // implementations combine duplicate-name-different-case headers with commas. So
+  // if a discovery bundle includes `authorization` (e.g., from a lower-casing HTTP
+  // client) the generated client must drop it before setting the live `Authorization`
+  // bearer, or upstream gets a malformed combined value.
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "mcpaql-header-collision-"));
+  const schemaPath = path.join(tempRoot, "adapter-schema.json");
+  const provenancePath = path.join(tempRoot, "adapter-provenance.json");
+  const adapterOutDir = path.join(tempRoot, "adapter");
+
+  await writeFile(
+    schemaPath,
+    JSON.stringify({
+      name: "collision-adapter",
+      type: "adapter",
+      version: "0.1.0",
+      description: "Synthetic adapter to verify case-insensitive auth-header filtering.",
+      target: { base_url: "https://example.com/mcp", transport: "http", protocol: "custom", serialization: "json" },
+      auth: { type: "bearer", header: "Authorization", prefix: "Bearer ", token_env: "FIXTURE_TOKEN" },
+      headers: { "X-Selector": "all", "authorization": "redacted" },
+      operations: { read: [{ name: "list_things", maps_to: "tool:list_things", description: "List things" }] },
+    }),
+  );
+  await writeFile(provenancePath, JSON.stringify({ operations: [{ operation_name: "list_things", endpoint: "READ" }] }));
+
+  await generateAdapterPackage({ schemaPath, provenancePath, outDir: adapterOutDir });
+  const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
+
+  // The emitted client must contain the case-insensitive skip-on-match guard before
+  // it sets the live bearer header, otherwise both keys end up in the headers map.
+  assert.match(serverSource, /name\.toLowerCase\(\) === authHeaderLower/);
+  // And the comment explaining the invariant should be present so future maintainers
+  // know the filter is load-bearing for HTTP-header-case correctness, not stylistic.
+  assert.match(serverSource, /HTTP header names are case-insensitive/);
+});
+
 test("schema builder omits headers field for empty headers object", async () => {
   // An empty `headers: {}` in the capture should produce the same shape as no headers
   // at all — no `headers` key on the generated schema.
@@ -204,13 +241,13 @@ test("generator forwards adapter schema headers to upstream", async () => {
   await generateAdapterPackage({ schemaPath, provenancePath, outDir: adapterOutDir });
   const serverSource = await readFile(path.join(adapterOutDir, "src/server.ts"), "utf8");
 
-  // The emitted client builds a headers object from schema.headers and merges in
-  // the bearer auth. Both must be present in the source for the upstream call
-  // to carry the discovery-time selector header.
-  assert.match(serverSource, /\.\.\.\(schema\.headers \?\? \{\}\)/);
-  assert.match(serverSource, /schema\.auth\.header \?\? "Authorization"/);
+  // The emitted client iterates schema.headers and merges in the bearer auth.
+  // Both must be present in the source for the upstream call to carry the
+  // discovery-time selector header.
+  assert.match(serverSource, /Object\.entries\(schema\.headers \?\? \{\}\)/);
+  assert.match(serverSource, /schema\.auth\?\.header \?\? "Authorization"/);
   // Embedded AdapterSchema type in the generated source must include `headers`
-  // so the clean `schema.headers` access type-checks without a cast.
+  // so the schema.headers access type-checks without a cast.
   assert.match(serverSource, /headers\?: Record<string, string>/);
 
   // The bundled schema.json in the generated package must carry the headers field through.
