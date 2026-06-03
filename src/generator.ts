@@ -16,6 +16,7 @@ export async function generateAdapterPackage(options: {
   const provenance = options.provenancePath
     ? await readJsonFile<Record<string, unknown>>(options.provenancePath)
     : undefined;
+  // Preserve supplied provenance verbatim; core only creates generated_at when it is absent.
   const adapterPackage = generateAdapterPackageContents({ schema, provenance });
 
   for (const file of adapterPackage.files) {

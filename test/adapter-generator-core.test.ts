@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { builtinModules } from "node:module";
 import path from "node:path";
 import test from "node:test";
+import ts from "typescript";
 
 import {
   buildSchemaFromDiscoveryBundle,
   generateAdapterPackage,
+  type AdapterSchemaDocument,
   type DiscoveryBundle,
 } from "@mcpaql/adapter-generator-core";
 
@@ -72,11 +75,64 @@ test("adapter-generator-core builds schema and adapter files from in-memory inpu
 test("adapter-generator-core source has no live Node builtin imports", async () => {
   const coreSrcDir = path.resolve(import.meta.dirname, "../packages/adapter-generator-core/src");
   const files = ["index.ts", "types.ts"];
+  const builtinModuleNames = new Set(builtinModules.map((moduleName) => moduleName.replace(/^node:/, "")));
 
   for (const file of files) {
     const source = await readFile(path.join(coreSrcDir, file), "utf8");
-    const topLevelImports = source.split("\n\nexport interface AdapterPackageFile")[0];
-    assert.doesNotMatch(topLevelImports, /^\s*import\s+.*["']node:/m);
-    assert.doesNotMatch(topLevelImports, /^\s*import\s+.*["'](?:fs|path|child_process|node:fs|node:path|node:child_process)["']/m);
+    const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+
+    for (const statement of sourceFile.statements) {
+      if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) {
+        continue;
+      }
+
+      const { line, character } = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile));
+      const specifier = statement.moduleSpecifier.text;
+      const normalizedSpecifier = specifier.replace(/^node:/, "");
+
+      assert.equal(character, 0, `${file}:${line + 1} import should be top-level`);
+      assert.equal(specifier.startsWith("node:"), false, `${file}:${line + 1} must not import ${specifier}`);
+      assert.equal(builtinModuleNames.has(normalizedSpecifier), false, `${file}:${line + 1} must not import Node builtin ${specifier}`);
+    }
   }
+});
+
+test("adapter-generator-core emits native-applescript adapter server source", () => {
+  const schema: AdapterSchemaDocument = {
+    name: "native-projects",
+    type: "adapter",
+    version: "0.1.0",
+    description: "Generated MCP-AQL adapter for Native Projects.",
+    target: {
+      base_url: "native-applescript://Native Projects",
+      transport: "native-applescript",
+      protocol: "custom",
+      serialization: "json",
+      application: "Native Projects",
+    },
+    operations: {
+      read: [
+        {
+          name: "list_projects",
+          maps_to: "native-applescript:command:listProjects",
+          description: "List projects",
+        },
+      ],
+    },
+  };
+
+  const adapterPackage = generateAdapterPackage({
+    schema,
+    provenance: { generated_at: "2026-06-03T00:00:00.000Z" },
+  });
+  const serverSource = adapterPackage.files.find((file) => file.path === "src/server.ts")?.content ?? "";
+  const schemaJson = adapterPackage.files.find((file) => file.path === "src/schema.json")?.content ?? "";
+
+  assert.match(serverSource, /import \{ execFile \} from "node:child_process"/);
+  assert.match(serverSource, /const execFileAsync = promisify\(execFile\)/);
+  assert.match(serverSource, /\/usr\/bin\/osascript/);
+  assert.match(serverSource, /function buildJxaScript/);
+  assert.match(serverSource, /case "command"/);
+  assert.match(serverSource, /native-applescript schema is missing target\.application/);
+  assert.match(schemaJson, /native-applescript:command:listProjects/);
 });
