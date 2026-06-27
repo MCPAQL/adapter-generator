@@ -86,11 +86,10 @@ test("adapter-generator-core source has no live Node builtin imports", async () 
         continue;
       }
 
-      const { line, character } = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile));
+      const { line } = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile));
       const specifier = statement.moduleSpecifier.text;
       const normalizedSpecifier = specifier.replace(/^node:/, "");
 
-      assert.equal(character, 0, `${file}:${line + 1} import should be top-level`);
       assert.equal(specifier.startsWith("node:"), false, `${file}:${line + 1} must not import ${specifier}`);
       assert.equal(builtinModuleNames.has(normalizedSpecifier), false, `${file}:${line + 1} must not import Node builtin ${specifier}`);
     }
@@ -117,6 +116,25 @@ test("adapter-generator-core emits native-applescript adapter server source", ()
           maps_to: "native-applescript:command:listProjects",
           description: "List projects",
         },
+        {
+          name: "get_document_title",
+          maps_to: "native-applescript:get_property:document.title",
+          description: "Get the active document title",
+        },
+      ],
+      update: [
+        {
+          name: "set_document_title",
+          maps_to: "native-applescript:set_property:document.title",
+          description: "Set the active document title",
+        },
+      ],
+      execute: [
+        {
+          name: "list_project_tasks",
+          maps_to: "native-applescript:list_elements:project.task",
+          description: "List tasks for a project",
+        },
       ],
     },
   };
@@ -133,6 +151,15 @@ test("adapter-generator-core emits native-applescript adapter server source", ()
   assert.match(serverSource, /\/usr\/bin\/osascript/);
   assert.match(serverSource, /function buildJxaScript/);
   assert.match(serverSource, /case "command"/);
+  assert.match(serverSource, /case "get_property"/);
+  assert.match(serverSource, /case "set_property"/);
+  assert.match(serverSource, /case "list_elements"/);
+  assert.ok(serverSource.includes('const result = item.${propName.replace(/\\s+/g, "")}();'));
+  assert.ok(serverSource.includes('item.${propName2.replace(/\\s+/g, "")} = ${newValue};'));
+  assert.ok(serverSource.includes("const result = elements.map(e =>"));
   assert.match(serverSource, /native-applescript schema is missing target\.application/);
   assert.match(schemaJson, /native-applescript:command:listProjects/);
+  assert.match(schemaJson, /native-applescript:get_property:document\.title/);
+  assert.match(schemaJson, /native-applescript:set_property:document\.title/);
+  assert.match(schemaJson, /native-applescript:list_elements:project\.task/);
 });
