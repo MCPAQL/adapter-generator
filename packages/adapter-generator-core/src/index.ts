@@ -5,6 +5,9 @@ import type {
   DiscoveryOperation,
   SchemaBuildOutput,
   SchemaBuildOverrides,
+  TemplateOverride,
+  TemplateOverridesDocument,
+  TemplateParamDef,
 } from "./types.js";
 
 export type {
@@ -17,6 +20,9 @@ export type {
   EndpointCategory,
   SchemaBuildOutput,
   SchemaBuildOverrides,
+  TemplateOverride,
+  TemplateOverridesDocument,
+  TemplateParamDef,
 } from "./types.js";
 
 export interface AdapterPackageFile {
@@ -307,7 +313,89 @@ npm run start
 `;
 }
 
-function buildNativeAppleScriptServerSource(schema: AdapterSchemaDocument): string {
+/**
+ * Emitted template runtime for native adapters generated with template
+ * overrides: parameter validation (required/type/defaults), interpolation
+ * restricted to declared parameters, and a guard that refuses to execute
+ * a script with unresolved placeholders — a missing parameter must never
+ * reach osascript as broken JXA.
+ */
+const NATIVE_TEMPLATE_RUNTIME = `type TemplateParamMeta = { type: string; optional?: boolean; default?: unknown; description?: string };
+type TemplateEntry = { language: string; script: string; params?: Record<string, TemplateParamMeta>; endpoint?: string; description?: string };
+const templates = rawTemplates as Record<string, TemplateEntry>;
+
+function validateTemplateParams(operationName: string, entry: TemplateEntry, params: Record<string, unknown>): Record<string, unknown> {
+  const filled: Record<string, unknown> = { ...params };
+  const missing: string[] = [];
+  const badTypes: string[] = [];
+  for (const [name, meta] of Object.entries(entry.params ?? {})) {
+    validateParamKey(name);
+    let value = filled[name];
+    if (value === undefined && meta.default !== undefined) {
+      value = meta.default;
+      filled[name] = value;
+    }
+    if (value === undefined) {
+      if (meta.optional !== true) missing.push(name);
+      continue;
+    }
+    if (meta.type === "integer" && !(typeof value === "number" && Number.isInteger(value))) {
+      badTypes.push(\`\${name} (expected integer)\`);
+    } else if (meta.type === "real" && typeof value !== "number") {
+      badTypes.push(\`\${name} (expected real)\`);
+    } else if (meta.type === "text" && typeof value !== "string") {
+      badTypes.push(\`\${name} (expected text)\`);
+    } else if (meta.type === "boolean" && typeof value !== "boolean") {
+      badTypes.push(\`\${name} (expected boolean)\`);
+    }
+  }
+  if (missing.length > 0) {
+    throw new NativeExecutionError("VALIDATION_MISSING_PARAM", \`Operation '\${operationName}' is missing required parameter(s): \${missing.join(", ")}. Use introspect for the parameter list.\`);
+  }
+  if (badTypes.length > 0) {
+    throw new NativeExecutionError("VALIDATION_INVALID_PARAM_TYPE", \`Operation '\${operationName}' received wrong parameter type(s): \${badTypes.join(", ")}.\`);
+  }
+  return filled;
+}
+
+function interpolateTemplate(operationName: string, entry: TemplateEntry, params: Record<string, unknown>): string {
+  let result = entry.script;
+  for (const name of Object.keys(entry.params ?? {})) {
+    const value = params[name];
+    if (value === undefined) continue;
+    result = result.replaceAll("{{" + name + "}}", sanitizeForJxa(value));
+  }
+  const unresolved = [...new Set(Array.from(result.matchAll(/\\{\\{(\\w+)\\}\\}/g), (m) => m[1]))];
+  if (unresolved.length > 0) {
+    throw new NativeExecutionError("VALIDATION_UNRESOLVED_PARAM", \`Operation '\${operationName}' template references parameter(s) with no supplied value or default: \${unresolved.join(", ")}. Refusing to execute a broken script.\`);
+  }
+  return result;
+}
+`;
+
+/**
+ * Emitted dispatch branch: templated operations short-circuit before the
+ * maps_to fallback.
+ */
+const NATIVE_TEMPLATE_DISPATCH = `  // Own-property lookup: imported JSON inherits from Object.prototype, so an
+  // operation named 'constructor' or 'toString' must not resolve to an
+  // inherited function and shadow its maps_to implementation.
+  const template = Object.prototype.hasOwnProperty.call(templates, operationName)
+    ? templates[operationName]
+    : undefined;
+  if (template) {
+    try {
+      const filled = validateTemplateParams(operationName, template, params);
+      const script = interpolateTemplate(operationName, template, filled);
+      const result = await executeJxa(script, template.language);
+      return { success: true, data: result };
+    } catch (error: unknown) {
+      return nativeErrorResult(error);
+    }
+  }
+`;
+
+function buildNativeAppleScriptServerSource(schema: AdapterSchemaDocument, hasTemplates = false): string {
   return `import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -322,7 +410,7 @@ import type {
   ListToolsResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import rawSchema from "./schema.json" with { type: "json" };
-
+${hasTemplates ? 'import rawTemplates from "./templates.json" with { type: "json" };\n' : ""}
 const execFileAsync = promisify(execFile);
 
 type EndpointKey = "create" | "read" | "update" | "delete" | "execute";
@@ -368,7 +456,10 @@ type OperationIndexEntry = {
 const schema = rawSchema as unknown as AdapterSchema;
 if (!schema.target.application) throw new Error("native-applescript schema is missing target.application");
 const APPLICATION = schema.target.application;
-const TIMEOUT_MS = 30_000;
+const TIMEOUT_MS = (() => {
+  const raw = Number(process.env.MCPAQL_NATIVE_TIMEOUT_MS ?? "");
+  return Number.isFinite(raw) && raw >= 1_000 ? raw : 30_000;
+})();
 const MAX_OUTPUT = 10 * 1024 * 1024;
 
 const TOOL_NAME_BY_ENDPOINT: Record<EndpointName, string> = {
@@ -527,16 +618,73 @@ function buildJxaScript(mapsTo: string, params: Record<string, unknown>): string
   }
 }
 
-async function executeJxa(script: string): Promise<unknown> {
+class NativeExecutionError extends Error {
+  readonly code: string;
+  readonly detail?: Record<string, unknown>;
+  constructor(code: string, message: string, detail?: Record<string, unknown>) {
+    super(message);
+    this.name = "NativeExecutionError";
+    this.code = code;
+    this.detail = detail;
+  }
+}
+
+function nativeErrorResult(error: unknown) {
+  if (error instanceof NativeExecutionError) {
+    return { success: false, error: { code: error.code, message: error.message, ...(error.detail ?? {}) } };
+  }
+  return { success: false, error: { code: "TRANSPORT_NATIVE_EXECUTION_ERROR", message: error instanceof Error ? error.message : String(error) } };
+}
+
+async function executeJxa(script: string, language: string = "JavaScript"): Promise<unknown> {
+  const args = language === "AppleScript" ? ["-e", script] : ["-l", "JavaScript", "-e", script];
+  const startedAt = Date.now();
   try {
-    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], {
+    const { stdout } = await execFileAsync("/usr/bin/osascript", args, {
       timeout: TIMEOUT_MS,
       maxBuffer: MAX_OUTPUT,
     });
     try { return JSON.parse(stdout.trim()); } catch { return stdout.trim(); }
   } catch (error: unknown) {
-    const execError = error as { stderr?: string; status?: number };
-    throw new Error(\`osascript failed: \${execError.stderr ?? String(error)}\`);
+    // Never surface an empty failure: name the exit code or signal, the
+    // elapsed time vs the limit, and preserve execution-layer causes
+    // (string error codes such as maxBuffer overflows) that reject with
+    // empty stderr.
+    const execError = error as {
+      code?: string | number;
+      killed?: boolean;
+      signal?: string;
+      stdout?: string;
+      stderr?: string;
+    };
+    const elapsedMs = Date.now() - startedAt;
+    const timedOut = execError.killed === true || execError.signal === "SIGTERM";
+    const stringCode = typeof execError.code === "string" ? execError.code : undefined;
+    let stderr = (execError.stderr ?? "").trim();
+    if (stderr === "" && stringCode !== undefined) {
+      stderr = \`\${stringCode}: \${error instanceof Error ? error.message : String(error)}\`;
+    }
+    const exitCode = typeof execError.code === "number" ? execError.code : (timedOut ? -1 : 1);
+    const stdoutPreview = (execError.stdout ?? "").trim().slice(0, 200) || undefined;
+    const parts: string[] = [];
+    if (timedOut) {
+      parts.push(\`osascript timed out after \${elapsedMs}ms (limit \${TIMEOUT_MS}ms)\`);
+    } else if (execError.signal) {
+      parts.push(\`osascript was terminated by \${execError.signal} after \${elapsedMs}ms\`);
+    } else {
+      parts.push(\`osascript exited with code \${exitCode} after \${elapsedMs}ms\`);
+    }
+    if (!timedOut) {
+      parts.push(stderr !== "" ? \`stderr: \${stderr.slice(0, 500)}\${stderr.length > 500 ? "…" : ""}\` : "stderr was empty");
+    }
+    if ((timedOut || stderr === "") && stdoutPreview !== undefined) {
+      parts.push(\`stdout preview: \${stdoutPreview}\`);
+    }
+    throw new NativeExecutionError(
+      timedOut ? "TRANSPORT_NATIVE_TIMEOUT" : "TRANSPORT_NATIVE_EXECUTION_ERROR",
+      parts.join(". "),
+      { exitCode, signal: execError.signal ?? null, elapsedMs, timeoutMs: TIMEOUT_MS, stderr: stderr === "" ? undefined : stderr, stdoutPreview },
+    );
   }
 }
 
@@ -591,15 +739,16 @@ function buildIntrospection(params: Record<string, unknown>) {
   return { success: false, error: { code: "VALIDATION_INVALID_QUERY", message: \`Unknown introspection query: \${String(params.query)}\` } };
 }
 
+${hasTemplates ? NATIVE_TEMPLATE_RUNTIME : ""}
 async function handleNativeOperation(operationName: string, params: Record<string, unknown>) {
-  const item = TOOL_BY_OPERATION.get(operationName);
+${hasTemplates ? NATIVE_TEMPLATE_DISPATCH : ""}  const item = TOOL_BY_OPERATION.get(operationName);
   if (!item) return { success: false, error: { code: "NOT_FOUND_OPERATION", message: \`Unknown operation: \${operationName}\` } };
   try {
     const script = buildJxaScript(item.definition.maps_to, params);
     const result = await executeJxa(script);
     return { success: true, data: result };
   } catch (error: unknown) {
-    return { success: false, error: { code: "TRANSPORT_NATIVE_EXECUTION_ERROR", message: error instanceof Error ? error.message : String(error) } };
+    return nativeErrorResult(error);
   }
 }
 
@@ -1169,19 +1318,142 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 `;
 }
 
+const TEMPLATE_PARAM_TYPES = new Set(["text", "integer", "boolean", "real"]);
+const IDENTIFIER_PATTERN = /^[a-zA-Z_][\w]*$/;
+
+function templateParamToSchemaParam(meta: TemplateParamDef): {
+  type: string;
+  required: boolean;
+  default?: unknown;
+  description?: string;
+} {
+  const required = meta.optional !== true && meta.default === undefined;
+  const param: { type: string; required: boolean; default?: unknown; description?: string } = {
+    type: meta.type,
+    required,
+  };
+  if (meta.default !== undefined) {
+    param.default = meta.default;
+  }
+  if (meta.description !== undefined) {
+    param.description = meta.description;
+  }
+  return param;
+}
+
+function validateTemplates(doc: TemplateOverridesDocument, schema: AdapterSchemaDocument): void {
+  if (schema.target.transport !== "native-applescript") {
+    throw new Error("Template overrides are only supported for native-applescript adapters.");
+  }
+  const knownOperations = new Set<string>();
+  for (const operations of Object.values(schema.operations)) {
+    for (const operation of operations ?? []) {
+      knownOperations.add(operation.name);
+    }
+  }
+  for (const [name, template] of Object.entries(doc.templates)) {
+    if (!IDENTIFIER_PATTERN.test(name)) {
+      throw new Error(`Invalid template operation name '${name}': must be an identifier.`);
+    }
+    if (typeof template.script !== "string" || template.script.trim() === "") {
+      throw new Error(`Template '${name}' has an empty script.`);
+    }
+    if (template.language !== "JavaScript" && template.language !== "AppleScript") {
+      throw new Error(`Template '${name}' has invalid language '${String(template.language)}'.`);
+    }
+    for (const [paramName, meta] of Object.entries(template.params ?? {})) {
+      if (!IDENTIFIER_PATTERN.test(paramName)) {
+        throw new Error(`Template '${name}' has invalid parameter name '${paramName}'.`);
+      }
+      if (!TEMPLATE_PARAM_TYPES.has(meta.type)) {
+        throw new Error(`Template '${name}' parameter '${paramName}' has invalid type '${String(meta.type)}'.`);
+      }
+      if (meta.default !== undefined) {
+        const d = meta.default;
+        const defaultTypeOk =
+          (meta.type === "text" && typeof d === "string")
+          || (meta.type === "integer" && typeof d === "number" && Number.isInteger(d))
+          || (meta.type === "real" && typeof d === "number" && Number.isFinite(d))
+          || (meta.type === "boolean" && typeof d === "boolean");
+        if (!defaultTypeOk) {
+          throw new Error(`Template '${name}' parameter '${paramName}' declares type '${meta.type}' but its default ${JSON.stringify(d)} does not match — every call omitting it would fail type validation.`);
+        }
+      }
+    }
+    if (!knownOperations.has(name)) {
+      if (!template.endpoint || !VALID_ENDPOINTS.has(template.endpoint)) {
+        throw new Error(`Template-only operation '${name}' requires a valid CRUDE endpoint.`);
+      }
+      if (!template.description) {
+        throw new Error(`Template-only operation '${name}' requires a description.`);
+      }
+    }
+  }
+}
+
+/**
+ * Merge template overrides into the adapter schema so introspection tells
+ * the truth: template params (with required/default derived from the
+ * template declaration) replace the params of matching schema operations,
+ * and template-only operations are injected under their declared endpoint.
+ */
+function applyTemplatesToSchema(
+  schema: AdapterSchemaDocument,
+  doc: TemplateOverridesDocument,
+): AdapterSchemaDocument {
+  const next: AdapterSchemaDocument = JSON.parse(JSON.stringify(schema)) as AdapterSchemaDocument;
+  const operationsByName = new Map<string, AdapterSchemaOperation>();
+  for (const operations of Object.values(next.operations)) {
+    for (const operation of operations ?? []) {
+      operationsByName.set(operation.name, operation);
+    }
+  }
+  for (const [name, template] of Object.entries(doc.templates)) {
+    const mappedParams: Record<string, ReturnType<typeof templateParamToSchemaParam>> = {};
+    for (const [paramName, meta] of Object.entries(template.params ?? {})) {
+      mappedParams[paramName] = templateParamToSchemaParam(meta);
+    }
+    const existing = operationsByName.get(name);
+    if (existing) {
+      existing.params = mappedParams;
+      if (template.description) {
+        existing.description = template.description;
+      }
+      continue;
+    }
+    const endpointKey = ENDPOINT_KEY_BY_CATEGORY[template.endpoint as keyof typeof ENDPOINT_KEY_BY_CATEGORY];
+    const bucket = next.operations[endpointKey] ?? (next.operations[endpointKey] = []);
+    bucket.push({
+      name,
+      maps_to: `native-applescript:template:${name}`,
+      description: template.description ?? name,
+      params: mappedParams,
+    } as AdapterSchemaOperation);
+  }
+  return next;
+}
+
 export function generateAdapterPackage(options: {
   schema: AdapterSchemaDocument;
   provenance?: Record<string, unknown>;
   generatedAt?: string;
+  templates?: TemplateOverridesDocument;
 }): AdapterPackageContents {
-  const schema = options.schema;
+  let schema = options.schema;
   const provenance = options.provenance ?? { generated_at: options.generatedAt ?? new Date().toISOString() };
   if (schema.target.transport === "native-applescript" && !schema.target.application) {
     throw new Error("native-applescript adapter schema requires target.application");
   }
 
+  const hasTemplates = options.templates !== undefined
+    && Object.keys(options.templates.templates ?? {}).length > 0;
+  if (hasTemplates) {
+    validateTemplates(options.templates!, schema);
+    schema = applyTemplatesToSchema(schema, options.templates!);
+  }
+
   const serverSource = schema.target.transport === "native-applescript"
-    ? buildNativeAppleScriptServerSource(schema)
+    ? buildNativeAppleScriptServerSource(schema, hasTemplates)
     : buildServerSource(schema);
 
   const dependencies: Record<string, string> = { "@modelcontextprotocol/sdk": "^1.27.1" };
@@ -1221,11 +1493,18 @@ export function generateAdapterPackage(options: {
     include: ["src/**/*.ts"],
   };
 
+  const files: AdapterPackageFile[] = [
+    { path: "src/schema.json", content: jsonContent(schema) },
+    { path: "src/provenance.json", content: jsonContent(provenance) },
+  ];
+  if (hasTemplates) {
+    files.push({ path: "src/templates.json", content: jsonContent(options.templates!.templates) });
+  }
+
   return {
     packageName: packageName(schema),
     files: [
-      { path: "src/schema.json", content: jsonContent(schema) },
-      { path: "src/provenance.json", content: jsonContent(provenance) },
+      ...files,
       { path: "package.json", content: jsonContent(packageJson) },
       { path: "tsconfig.json", content: jsonContent(tsconfig) },
       { path: "src/server.ts", content: serverSource },
