@@ -147,3 +147,26 @@ test("invalid template param type is refused at generation time", () => {
     /invalid type 'banana'/,
   );
 });
+
+test("emitted dispatch resolves templates by own property only", () => {
+  const pkg = generateAdapterPackage({ schema: nativeSchema(), templates: templatesDoc() });
+  const server = fileContent(pkg, "src/server.ts");
+  assert.ok(
+    server.includes("Object.prototype.hasOwnProperty.call(templates, operationName)"),
+    "an operation named 'constructor' must not resolve to an inherited function",
+  );
+});
+
+test("a default that does not match the declared type is refused at generation time", () => {
+  const doc = templatesDoc();
+  (doc.templates.list_messages.params!.cursor as { default: unknown }).default = "zero";
+  assert.throws(
+    () => generateAdapterPackage({ schema: nativeSchema(), templates: doc }),
+    /default "zero" does not match/,
+  );
+  (doc.templates.list_messages.params!.cursor as { default: unknown }).default = null;
+  assert.throws(
+    () => generateAdapterPackage({ schema: nativeSchema(), templates: doc }),
+    /does not match/,
+  );
+});

@@ -377,7 +377,12 @@ function interpolateTemplate(operationName: string, entry: TemplateEntry, params
  * Emitted dispatch branch: templated operations short-circuit before the
  * maps_to fallback.
  */
-const NATIVE_TEMPLATE_DISPATCH = `  const template = templates[operationName];
+const NATIVE_TEMPLATE_DISPATCH = `  // Own-property lookup: imported JSON inherits from Object.prototype, so an
+  // operation named 'constructor' or 'toString' must not resolve to an
+  // inherited function and shadow its maps_to implementation.
+  const template = Object.prototype.hasOwnProperty.call(templates, operationName)
+    ? templates[operationName]
+    : undefined;
   if (template) {
     try {
       const filled = validateTemplateParams(operationName, template, params);
@@ -1362,6 +1367,17 @@ function validateTemplates(doc: TemplateOverridesDocument, schema: AdapterSchema
       }
       if (!TEMPLATE_PARAM_TYPES.has(meta.type)) {
         throw new Error(`Template '${name}' parameter '${paramName}' has invalid type '${String(meta.type)}'.`);
+      }
+      if (meta.default !== undefined) {
+        const d = meta.default;
+        const defaultTypeOk =
+          (meta.type === "text" && typeof d === "string")
+          || (meta.type === "integer" && typeof d === "number" && Number.isInteger(d))
+          || (meta.type === "real" && typeof d === "number" && Number.isFinite(d))
+          || (meta.type === "boolean" && typeof d === "boolean");
+        if (!defaultTypeOk) {
+          throw new Error(`Template '${name}' parameter '${paramName}' declares type '${meta.type}' but its default ${JSON.stringify(d)} does not match — every call omitting it would fail type validation.`);
+        }
       }
     }
     if (!knownOperations.has(name)) {
