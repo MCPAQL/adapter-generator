@@ -170,3 +170,38 @@ export interface SchemaBuildOutput {
   };
   warnings: DiscoveryBundle["normalized_bundle"]["warnings"];
 }
+
+/**
+ * A parameter declaration for a native script template.
+ */
+export interface TemplateParamDef {
+  type: "text" | "integer" | "boolean" | "real";
+  /** May be omitted by callers without error (the script must cope). */
+  optional?: boolean;
+  /**
+   * Value used when the caller omits the parameter. A defaulted parameter
+   * is never treated as missing; the default is sanitized exactly like a
+   * supplied value.
+   */
+  default?: unknown;
+  description?: string;
+}
+
+/**
+ * A hand-authored script template that replaces (or adds to) the
+ * maps_to-derived behavior of a native-applescript adapter operation.
+ */
+export interface TemplateOverride {
+  language: "JavaScript" | "AppleScript";
+  /** Script body with {{param_name}} placeholders. */
+  script: string;
+  params?: Record<string, TemplateParamDef>;
+  /** CRUDE endpoint — required for template-only operations not present in the schema. */
+  endpoint?: EndpointCategory;
+  description?: string;
+}
+
+export interface TemplateOverridesDocument {
+  schema_version: "1.0.0-draft";
+  templates: Record<string, TemplateOverride>;
+}
