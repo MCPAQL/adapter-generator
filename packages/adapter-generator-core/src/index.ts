@@ -526,7 +526,7 @@ for (const [endpoint, operations] of Object.entries(schema.operations) as Array<
 
 function textResult(payload: unknown): CallToolResult {
   return {
-    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(payload) }],
   };
 }
 
@@ -957,7 +957,7 @@ let upstreamTransport: StreamableHTTPClientTransport | undefined;
 
 function textResult(payload: unknown): CallToolResult {
   return {
-    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(payload) }],
   };
 }
 
@@ -1297,8 +1297,7 @@ ${tenancy ? `  let tenant: TenantRef | undefined;
           structured_content: result.structuredContent ?? null,
         },
       },
-      _meta: { provenance${tenancy ? ", ...tenantMeta" : ""} },
-    };
+${tenancy ? "      _meta: tenantMeta,\n" : ""}    };
   }
 
   return {
@@ -1309,8 +1308,7 @@ ${tenancy ? `  let tenant: TenantRef | undefined;
       structured_content: result.structuredContent ?? null,
       is_error: Boolean(result.isError),
     },
-    _meta: { provenance${tenancy ? ", ...tenantMeta" : ""} },
-  };
+${tenancy ? "    _meta: tenantMeta,\n" : ""}  };
 }
 
 const server = new Server(
