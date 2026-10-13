@@ -48,7 +48,7 @@ Some MCP servers pick the tenant (project, workspace, team) from a request heade
     "name_field": "name",
     "default_field": "default",
     "default_env": "CHIEF_PROJECT",
-    "unscoped_operations": ["create_project", "update_project"]
+    "unscoped_operations": ["create_project", "update_project", "list_project_members", "create_project_invitation", "delete_project_invitation"]
   }
 }
 ```
@@ -63,4 +63,4 @@ The generated adapter then:
 - picks the starting tenant from `default_env` if set, otherwise the tenant flagged by `default_field`, otherwise the only tenant
 - drops any captured static tenant header and keeps one upstream connection per tenant
 
-Schema build fails if `list_operation` is not a READ operation, an unscoped operation is unknown, `noun` is not lowercase snake_case, or a generated operation name collides with an existing one. See `examples/generated/chief-mcp-projects` for a worked example.
+Schema build fails if the upstream is not HTTP, `list_operation` is not a READ operation or has required parameters, an operation that declares `<noun>_id` is not listed as unscoped, an unscoped operation is unknown, `noun` is not lowercase snake_case, or a generated operation name collides with an existing one. See `examples/generated/chief-mcp-projects` for a worked example.

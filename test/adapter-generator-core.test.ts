@@ -263,3 +263,51 @@ test("tenancy runtime is emitted only for tenant-scoped schemas and parses", () 
   });
   assert.deepEqual(diagnostics?.map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n")), []);
 });
+
+test("tenancy validation rejects unsafe configurations", () => {
+  const withOwnedParam: DiscoveryBundle = {
+    ...tenancyBundle,
+    normalized_bundle: {
+      ...tenancyBundle.normalized_bundle,
+      operations: [
+        ...tenancyBundle.normalized_bundle.operations,
+        {
+          source_tool_name: "list_members",
+          operation_name: "list_members",
+          description: "List members of a project",
+          endpoint: "READ",
+          endpoint_confidence: "high",
+          danger_level: "safe",
+          needs_review: false,
+          review_reasons: [],
+          params: [{ name: "project_id", original_name: "project_id", type: "string", required: true }],
+          maps_to: "tool:list_members",
+        },
+      ],
+    },
+  } as DiscoveryBundle;
+  assert.throws(
+    () => buildSchemaFromDiscoveryBundle({ bundle: withOwnedParam, overrides: { tenancy: fixtureTenancy } }),
+    /'list_members' declares 'project_id'; add it to tenancy\.unscoped_operations/,
+  );
+  assert.doesNotThrow(() =>
+    buildSchemaFromDiscoveryBundle({ bundle: withOwnedParam, overrides: { tenancy: { ...fixtureTenancy, unscoped_operations: ["list_members"] } } }),
+  );
+});
+
+test("generated README lists env-sourced headers and the tenancy start variable", () => {
+  const scoped = buildSchemaFromDiscoveryBundle({
+    bundle: { ...tenancyBundle, source: { ...tenancyBundle.source, capture_config_redacted: { transport: "streamable_http", headers: { "X-Region": "${env:FIXTURE_REGION}" } } } },
+    overrides: { tenancy: { ...fixtureTenancy, default_env: "FIXTURE_PROJECT" } },
+  });
+  const readme = generateAdapterPackage({ schema: scoped.schema }).files.find((file) => file.path === "README.md")?.content ?? "";
+  assert.match(readme, /`FIXTURE_REGION` \(required\): sent as the `X-Region` header\./);
+  assert.match(readme, /`FIXTURE_PROJECT` \(optional\): starting project, by id or name\./);
+});
+
+test("tenancy runtime keeps operation-owned tenant params and rejects non-string selectors", () => {
+  const scoped = buildSchemaFromDiscoveryBundle({ bundle: tenancyBundle, overrides: { tenancy: fixtureTenancy } });
+  const source = generateAdapterPackage({ schema: scoped.schema }).files.find((file) => file.path === "src/server.ts")?.content ?? "";
+  assert.match(source, /if \(!TENANT_PARAM_OPERATIONS\.has\(operationName\)\) return getActiveTenant\(\);/);
+  assert.match(source, /VALIDATION_INVALID_PARAM_TYPE/);
+});

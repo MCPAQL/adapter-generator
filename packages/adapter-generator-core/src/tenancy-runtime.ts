@@ -121,7 +121,9 @@ async function listTenants(refresh = false): Promise<Tenant[]> {
     throw new TenancyError("UPSTREAM_TOOL_ERROR", "Could not list " + TENANCY.noun + "s.", { content: result.content });
   }
   const structured = (result.structuredContent ?? {}) as Record<string, unknown>;
-  const items = structured[TENANCY.list_path ?? "data"];
+  const raw = structured[TENANCY.list_path ?? "data"];
+  // An account with no tenants may return null for the list.
+  const items = raw === null || raw === undefined ? [] : raw;
   if (!Array.isArray(items)) {
     throw new TenancyError("TENANCY_MISCONFIGURED", "List result has no array at '" + (TENANCY.list_path ?? "data") + "'.");
   }
@@ -171,13 +173,16 @@ async function getActiveTenant(): Promise<TenantRef> {
 // Picks the tenant for one proxied call and strips the generated tenant parameter.
 async function resolveCallTenant(operationName: string, params: Record<string, unknown>): Promise<TenantRef | undefined> {
   if (UNSCOPED_OPERATIONS.has(operationName)) return undefined;
-  if (TENANT_PARAM_OPERATIONS.has(operationName) && typeof params[TENANT_PARAM] === "string" && params[TENANT_PARAM] !== "") {
-    const tenant = await findTenant(params[TENANT_PARAM] as string);
-    delete params[TENANT_PARAM];
-    return { id: tenant.id, name: tenant.name, source: "call" };
-  }
+  // Operations that declare their own <noun>_id keep it untouched and run against the active tenant.
+  if (!TENANT_PARAM_OPERATIONS.has(operationName)) return getActiveTenant();
+  const selector = params[TENANT_PARAM];
   delete params[TENANT_PARAM];
-  return getActiveTenant();
+  if (selector === undefined || selector === null || selector === "") return getActiveTenant();
+  if (typeof selector !== "string") {
+    throw new TenancyError("VALIDATION_INVALID_PARAM_TYPE", TENANT_PARAM + " must be a " + TENANCY.noun + " id or name (string).");
+  }
+  const tenant = await findTenant(selector);
+  return { id: tenant.id, name: tenant.name, source: "call" };
 }
 
 async function handleTenancyOperation(operationName: string, params: Record<string, unknown>) {
