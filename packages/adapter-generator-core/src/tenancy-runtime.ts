@@ -129,9 +129,10 @@ async function listTenants(refresh = false): Promise<Tenant[]> {
   }
   tenantCache = items
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
-    .filter((item) => typeof item[TENANCY.id_field] === "string")
+    // Ids may be strings or numbers upstream; they travel as header strings.
+    .filter((item) => typeof item[TENANCY.id_field] === "string" || typeof item[TENANCY.id_field] === "number")
     .map((item) => ({
-      id: item[TENANCY.id_field] as string,
+      id: String(item[TENANCY.id_field]),
       name: typeof item[TENANCY.name_field] === "string" ? (item[TENANCY.name_field] as string) : null,
       is_default: TENANCY.default_field ? item[TENANCY.default_field] === true : false,
     }));
