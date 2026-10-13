@@ -184,3 +184,130 @@ test("generated adapter resolves ${env:VAR} header values at connect time", () =
   assert.equal(resolveHeaderValue("X-Partial", "prefix-${env:FIXTURE_PROJECT_ID}"), "prefix-${env:FIXTURE_PROJECT_ID}");
   assert.throws(() => resolveHeaderValue("X-Project-Id", "${env:MISSING_VAR}"), /MISSING_VAR.*X-Project-Id/);
 });
+
+const tenancyBundle: DiscoveryBundle = {
+  ...syntheticBundle,
+  source: {
+    ...syntheticBundle.source,
+    capture_config_redacted: {
+      transport: "streamable_http",
+      headers: { "x-project-id": "${env:FIXTURE_PROJECT_ID}", "X-MCP-Toolsets": "all" },
+    },
+  },
+  normalized_bundle: {
+    operations: [
+      ...syntheticBundle.normalized_bundle.operations,
+      {
+        source_tool_name: "list_projects",
+        operation_name: "list_projects",
+        description: "List projects",
+        endpoint: "READ",
+        endpoint_confidence: "high",
+        danger_level: "safe",
+        needs_review: false,
+        review_reasons: [],
+        params: [],
+        maps_to: "tool:list_projects",
+      },
+    ],
+    warnings: [],
+  },
+};
+
+const fixtureTenancy = {
+  header: "X-Project-Id",
+  noun: "project",
+  list_operation: "list_projects",
+  id_field: "project_id",
+  name_field: "name",
+  default_field: "default",
+};
+
+test("tenancy override attaches tenancy and drops the static tenant header", () => {
+  const output = buildSchemaFromDiscoveryBundle({ bundle: tenancyBundle, overrides: { tenancy: fixtureTenancy } });
+  assert.deepEqual(output.schema.tenancy, fixtureTenancy);
+  assert.deepEqual(output.schema.headers, { "X-MCP-Toolsets": "all" });
+});
+
+test("tenancy override is validated against the schema", () => {
+  assert.throws(
+    () => buildSchemaFromDiscoveryBundle({ bundle: tenancyBundle, overrides: { tenancy: { ...fixtureTenancy, list_operation: "missing" } } }),
+    /list_operation 'missing' must be a READ operation/,
+  );
+  assert.throws(
+    () => buildSchemaFromDiscoveryBundle({ bundle: tenancyBundle, overrides: { tenancy: { ...fixtureTenancy, noun: "Project" } } }),
+    /lowercase snake_case/,
+  );
+  assert.throws(
+    () => buildSchemaFromDiscoveryBundle({ bundle: tenancyBundle, overrides: { tenancy: { ...fixtureTenancy, unscoped_operations: ["nope"] } } }),
+    /unscoped operation 'nope'/,
+  );
+});
+
+test("tenancy runtime is emitted only for tenant-scoped schemas and parses", () => {
+  const plain = buildSchemaFromDiscoveryBundle({ bundle: tenancyBundle });
+  const scoped = buildSchemaFromDiscoveryBundle({ bundle: tenancyBundle, overrides: { tenancy: fixtureTenancy } });
+  const source = (schema: AdapterSchemaDocument) =>
+    generateAdapterPackage({ schema }).files.find((file) => file.path === "src/server.ts")?.content ?? "";
+
+  const plainSource = source(plain.schema);
+  const scopedSource = source(scoped.schema);
+  assert.doesNotMatch(plainSource, /Tenancy \(generated from schema\.tenancy\)/);
+  assert.match(scopedSource, /Tenancy \(generated from schema\.tenancy\)/);
+  assert.match(scopedSource, /await closeTenantClients\(\);/);
+  assert.match(scopedSource, /resolveCallTenant\(operationName, params\)/);
+
+  const { diagnostics } = ts.transpileModule(scopedSource, {
+    reportDiagnostics: true,
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+  });
+  assert.deepEqual(diagnostics?.map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n")), []);
+});
+
+test("tenancy validation rejects unsafe configurations", () => {
+  const withOwnedParam: DiscoveryBundle = {
+    ...tenancyBundle,
+    normalized_bundle: {
+      ...tenancyBundle.normalized_bundle,
+      operations: [
+        ...tenancyBundle.normalized_bundle.operations,
+        {
+          source_tool_name: "list_members",
+          operation_name: "list_members",
+          description: "List members of a project",
+          endpoint: "READ",
+          endpoint_confidence: "high",
+          danger_level: "safe",
+          needs_review: false,
+          review_reasons: [],
+          params: [{ name: "project_id", original_name: "project_id", type: "string", required: true }],
+          maps_to: "tool:list_members",
+        },
+      ],
+    },
+  } as DiscoveryBundle;
+  assert.throws(
+    () => buildSchemaFromDiscoveryBundle({ bundle: withOwnedParam, overrides: { tenancy: fixtureTenancy } }),
+    /'list_members' declares 'project_id'; add it to tenancy\.unscoped_operations/,
+  );
+  assert.doesNotThrow(() =>
+    buildSchemaFromDiscoveryBundle({ bundle: withOwnedParam, overrides: { tenancy: { ...fixtureTenancy, unscoped_operations: ["list_members"] } } }),
+  );
+});
+
+test("generated README lists env-sourced headers and the tenancy start variable", () => {
+  const scoped = buildSchemaFromDiscoveryBundle({
+    bundle: { ...tenancyBundle, source: { ...tenancyBundle.source, capture_config_redacted: { transport: "streamable_http", headers: { "X-Region": "${env:FIXTURE_REGION}" } } } },
+    overrides: { tenancy: { ...fixtureTenancy, default_env: "FIXTURE_PROJECT" } },
+  });
+  const readme = generateAdapterPackage({ schema: scoped.schema }).files.find((file) => file.path === "README.md")?.content ?? "";
+  assert.match(readme, /`FIXTURE_REGION` \(required\): sent as the `X-Region` header\./);
+  assert.match(readme, /`FIXTURE_PROJECT` \(optional\): starting project, by id or name\./);
+});
+
+test("tenancy runtime keeps operation-owned tenant params and rejects non-string selectors", () => {
+  const scoped = buildSchemaFromDiscoveryBundle({ bundle: tenancyBundle, overrides: { tenancy: fixtureTenancy } });
+  const source = generateAdapterPackage({ schema: scoped.schema }).files.find((file) => file.path === "src/server.ts")?.content ?? "";
+  assert.match(source, /if \(!TENANT_PARAM_OPERATIONS\.has\(operationName\)\) return getActiveTenant\(\);/);
+  assert.match(source, /VALIDATION_INVALID_PARAM_TYPE/);
+});

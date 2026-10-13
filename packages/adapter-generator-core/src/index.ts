@@ -1,6 +1,8 @@
+import { TENANCY_RUNTIME } from "./tenancy-runtime.js";
 import type {
   AdapterSchemaDocument,
   AdapterSchemaOperation,
+  AdapterTenancy,
   DiscoveryBundle,
   DiscoveryOperation,
   SchemaBuildOutput,
@@ -13,6 +15,7 @@ import type {
 export type {
   AdapterSchemaDocument,
   AdapterSchemaOperation,
+  AdapterTenancy,
   DangerLevel,
   DiscoveryBundle,
   DiscoveryOperation,
@@ -63,6 +66,46 @@ function validateOverrides(overrides?: SchemaBuildOverrides): void {
       }
 
       throw new Error(`Invalid override danger_level '${dangerLevel}' for operation key '${key}'.`);
+    }
+  }
+}
+
+const TENANCY_NOUN_PATTERN = /^[a-z][a-z0-9_]*$/;
+
+function validateTenancy(tenancy: AdapterTenancy, operations: DiscoveryOperation[]): void {
+  for (const field of ["header", "noun", "list_operation", "id_field", "name_field"] as const) {
+    if (typeof tenancy[field] !== "string" || tenancy[field].trim() === "") {
+      throw new Error(`Tenancy override requires a non-empty '${field}'.`);
+    }
+  }
+  if (!TENANCY_NOUN_PATTERN.test(tenancy.noun)) {
+    throw new Error(`Tenancy noun '${tenancy.noun}' must be lowercase snake_case.`);
+  }
+  const byName = new Map(operations.map((operation) => [operation.operation_name, operation]));
+  const listOperation = byName.get(tenancy.list_operation);
+  if (!listOperation || listOperation.endpoint !== "READ") {
+    throw new Error(`Tenancy list_operation '${tenancy.list_operation}' must be a READ operation in the schema.`);
+  }
+  if (listOperation.params.some((param) => param.required)) {
+    throw new Error(`Tenancy list_operation '${tenancy.list_operation}' must not have required parameters; the adapter calls it with none.`);
+  }
+  for (const name of tenancy.unscoped_operations ?? []) {
+    if (!byName.has(name)) {
+      throw new Error(`Tenancy unscoped operation '${name}' is not in the schema.`);
+    }
+  }
+  // An operation that owns <noun>_id takes the tenant as its own argument, so it must be sent without the header.
+  const tenantParam = `${tenancy.noun}_id`;
+  const unscoped = new Set([tenancy.list_operation, ...(tenancy.unscoped_operations ?? [])]);
+  for (const operation of operations) {
+    if (!unscoped.has(operation.operation_name) && operation.params.some((param) => param.name === tenantParam)) {
+      throw new Error(`Operation '${operation.operation_name}' declares '${tenantParam}'; add it to tenancy.unscoped_operations.`);
+    }
+  }
+  const reserved = [`get_active_${tenancy.noun}`, `set_active_${tenancy.noun}`];
+  for (const name of reserved) {
+    if (byName.has(name)) {
+      throw new Error(`Tenancy would generate '${name}', which collides with an existing operation.`);
     }
   }
 }
@@ -167,6 +210,20 @@ export function buildSchemaFromDiscoveryBundle(options: {
         ) as Record<string, string>
       : undefined;
 
+  const tenancy = overrides?.tenancy;
+  if (tenancy) {
+    if (transport !== "http") {
+      throw new Error("Tenancy is supported only for HTTP upstreams.");
+    }
+    validateTenancy(tenancy, operations);
+    // The adapter chooses the tenant per call, so a captured static tenant header must not ride along.
+    if (headers) {
+      for (const name of Object.keys(headers)) {
+        if (name.toLowerCase() === tenancy.header.toLowerCase()) delete headers[name];
+      }
+    }
+  }
+
   const schema: AdapterSchemaDocument = {
     name: adapterName,
     type: "adapter",
@@ -191,6 +248,7 @@ export function buildSchemaFromDiscoveryBundle(options: {
           }
         : undefined,
     ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
+    ...(tenancy ? { tenancy } : {}),
     operations: {
       read: [],
     },
@@ -297,6 +355,17 @@ npm run start
     schema.auth?.type === "bearer"
       ? `Set \`${schema.auth.token_env ?? "UPSTREAM_BEARER_TOKEN"}\` and run:`
       : "Run:";
+  // Header values of the form \${env:VAR} must be set before the first call; the tenancy start variable is optional.
+  const headerEnvVars = Object.entries(schema.headers ?? {})
+    .map(([name, value]) => [name, /^\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value)?.[1]] as const)
+    .filter((entry): entry is readonly [string, string] => Boolean(entry[1]));
+  const envLines = [
+    ...headerEnvVars.map(([name, variable]) => `- \`${variable}\` (required): sent as the \`${name}\` header.`),
+    ...(schema.tenancy?.default_env
+      ? [`- \`${schema.tenancy.default_env}\` (optional): starting ${schema.tenancy.noun}, by id or name.`]
+      : []),
+  ];
+  const envSection = envLines.length > 0 ? `\nAlso set:\n\n${envLines.join("\n")}\n` : "";
 
   return `## Running
 
@@ -305,7 +374,7 @@ Requires Node.js 20 or newer.
 Set \`MCPAQL_TARGET_BASE_URL\` if you want this adapter to connect to a different upstream server than the bundled \`${schema.target.base_url}\`.
 
 ${authLine}
-
+${envSection}
 \`\`\`bash
 npm install
 npm run start
@@ -802,6 +871,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 }
 
 function buildServerSource(schema: AdapterSchemaDocument): string {
+  const tenancy = Boolean(schema.tenancy);
   return `import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -881,7 +951,7 @@ type OperationArguments = Record<string, unknown> & {
 const schema = rawSchema as unknown as AdapterSchema;
 // Provenance is generated by the schema builder; this is a read-side projection of the broader metadata shape.
 const adapterProvenance = provenance as unknown as AdapterProvenance;
-
+${tenancy ? TENANCY_RUNTIME : ""}
 const TOOL_NAME_BY_ENDPOINT: Record<EndpointName, string> = {
   CREATE: "mcp_aql_create",
   READ: "mcp_aql_read",
@@ -954,11 +1024,7 @@ function resolveBaseUrl(): string {
   return schema.target.base_url;
 }
 
-async function getUpstreamClient(): Promise<Client> {
-  if (upstreamClient) {
-    return upstreamClient;
-  }
-
+function buildUpstreamHeaders(): Record<string, string> {
   // Carry discovery-time headers (e.g., toolset selectors) and add the live bearer
   // token. HTTP header names are case-insensitive, and some Fetch implementations
   // combine duplicate-name-different-case headers with commas, so we must drop any
@@ -976,6 +1042,15 @@ async function getUpstreamClient(): Promise<Client> {
   if (schema.auth?.type === "bearer") {
     headers[authHeaderName] = \`\${schema.auth.prefix ?? "Bearer "}\${resolveToken()}\`;
   }
+  return headers;
+}
+
+async function getUpstreamClient(): Promise<Client> {
+  if (upstreamClient) {
+    return upstreamClient;
+  }
+
+  const headers = buildUpstreamHeaders();
   const transport = new StreamableHTTPClientTransport(new URL(resolveBaseUrl()), {
     requestInit: {
       headers: Object.keys(headers).length > 0 ? headers : undefined,
@@ -1216,7 +1291,18 @@ async function proxyOperation(operationName: string, params: Record<string, unkn
     };
   }
 
-  const upstream = await getUpstreamClient();
+${tenancy ? `  let tenant: TenantRef | undefined;
+  try {
+    if (item.definition.maps_to.startsWith("adapter:")) {
+      return await handleTenancyOperation(operationName, params);
+    }
+    params = { ...params };
+    tenant = await resolveCallTenant(operationName, params);
+  } catch (error) {
+    return tenancyErrorResult(error);
+  }
+  const upstream = await getTenantClient(tenant?.id);
+  const tenantMeta = tenant ? { [TENANCY.noun]: { id: tenant.id, name: tenant.name, source: tenant.source } } : {};` : `  const upstream = await getUpstreamClient();`}
   const sourceTool = item.definition.maps_to.replace(/^tool:/, "");
   const upstreamParams = mapParamsToUpstream(operationName, params);
   const result = await upstream.callTool({
@@ -1236,7 +1322,7 @@ async function proxyOperation(operationName: string, params: Record<string, unkn
           structured_content: result.structuredContent ?? null,
         },
       },
-      _meta: { provenance },
+      _meta: { provenance${tenancy ? ", ...tenantMeta" : ""} },
     };
   }
 
@@ -1248,7 +1334,7 @@ async function proxyOperation(operationName: string, params: Record<string, unkn
       structured_content: result.structuredContent ?? null,
       is_error: Boolean(result.isError),
     },
-    _meta: { provenance },
+    _meta: { provenance${tenancy ? ", ...tenantMeta" : ""} },
   };
 }
 
@@ -1314,7 +1400,7 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 
 async function closeUpstreamTransport() {
-  if (upstreamTransport) {
+${tenancy ? "  await closeTenantClients();\n" : ""}  if (upstreamTransport) {
     await upstreamTransport.close();
     upstreamTransport = undefined;
     upstreamClient = undefined;

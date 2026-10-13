@@ -32,3 +32,35 @@ import {
 ```
 
 The core package does not import Node-only APIs such as `fs`, `path`, or `child_process`. The root CLI package is responsible for reading inputs from disk and writing returned file payloads to the output directory.
+
+## Tenant-scoped upstreams
+
+Some MCP servers pick the tenant (project, workspace, team) from a request header that is fixed when the server is configured. The model cannot see which tenant it is in or change it. Declare `tenancy` in the overrides file and the generated adapter handles tenants at runtime instead:
+
+```json
+{
+  "tenancy": {
+    "header": "X-Project-Id",
+    "noun": "project",
+    "list_operation": "list_projects",
+    "list_path": "data",
+    "id_field": "project_id",
+    "name_field": "name",
+    "default_field": "default",
+    "default_env": "CHIEF_PROJECT",
+    "unscoped_operations": ["create_project", "update_project", "list_project_members", "create_project_invitation", "delete_project_invitation"]
+  }
+}
+```
+
+The generated adapter then:
+
+- adds `get_active_<noun>` (READ), which returns the active tenant, how it was chosen, and every tenant the credential can reach
+- adds `set_active_<noun>` (UPDATE), which switches the active tenant for the session by id or case-insensitive name
+- adds an optional `<noun>_id` parameter (id or name) to every scoped operation, for one call against another tenant
+- reports the tenant each scoped call ran against in `_meta.<noun>`
+- sends `list_operation` and `unscoped_operations` without the tenant header
+- picks the starting tenant from `default_env` if set, otherwise the tenant flagged by `default_field`, otherwise the only tenant
+- drops any captured static tenant header and keeps one upstream connection per tenant
+
+Schema build fails if the upstream is not HTTP, `list_operation` is not a READ operation or has required parameters, an operation that declares `<noun>_id` is not listed as unscoped, an unscoped operation is unknown, `noun` is not lowercase snake_case, or a generated operation name collides with an existing one. See `examples/generated/chief-mcp-projects` for a worked example.
