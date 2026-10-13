@@ -930,6 +930,21 @@ function resolveToken(): string {
   throw new Error(\`Missing upstream bearer token in env var '\${configured ?? "UPSTREAM_BEARER_TOKEN"}'.\`);
 }
 
+// A captured header value of the exact form "\${env:VAR_NAME}" is read from the
+// environment at connect time, so per-tenant identifiers (project or workspace ids)
+// never have to be committed in the generated schema.
+function resolveHeaderValue(name: string, value: string): string {
+  const match = /^\\$\\{env:([A-Za-z_][A-Za-z0-9_]*)\\}$/.exec(value);
+  if (!match) {
+    return value;
+  }
+  const resolved = process.env[match[1]];
+  if (!resolved) {
+    throw new Error(\`Missing env var '\${match[1]}' for upstream header '\${name}'.\`);
+  }
+  return resolved;
+}
+
 function resolveBaseUrl(): string {
   const override = process.env.MCPAQL_TARGET_BASE_URL?.trim();
   if (override) {
@@ -956,7 +971,7 @@ async function getUpstreamClient(): Promise<Client> {
   const headers: Record<string, string> = {};
   for (const [name, value] of Object.entries(schema.headers ?? {})) {
     if (name.toLowerCase() === authHeaderLower) continue;
-    headers[name] = value;
+    headers[name] = resolveHeaderValue(name, value);
   }
   if (schema.auth?.type === "bearer") {
     headers[authHeaderName] = \`\${schema.auth.prefix ?? "Bearer "}\${resolveToken()}\`;
