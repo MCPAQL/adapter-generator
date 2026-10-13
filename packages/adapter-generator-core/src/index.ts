@@ -86,9 +86,20 @@ function validateTenancy(tenancy: AdapterTenancy, operations: DiscoveryOperation
   if (!listOperation || listOperation.endpoint !== "READ") {
     throw new Error(`Tenancy list_operation '${tenancy.list_operation}' must be a READ operation in the schema.`);
   }
+  if (listOperation.params.some((param) => param.required)) {
+    throw new Error(`Tenancy list_operation '${tenancy.list_operation}' must not have required parameters; the adapter calls it with none.`);
+  }
   for (const name of tenancy.unscoped_operations ?? []) {
     if (!byName.has(name)) {
       throw new Error(`Tenancy unscoped operation '${name}' is not in the schema.`);
+    }
+  }
+  // An operation that owns <noun>_id takes the tenant as its own argument, so it must be sent without the header.
+  const tenantParam = `${tenancy.noun}_id`;
+  const unscoped = new Set([tenancy.list_operation, ...(tenancy.unscoped_operations ?? [])]);
+  for (const operation of operations) {
+    if (!unscoped.has(operation.operation_name) && operation.params.some((param) => param.name === tenantParam)) {
+      throw new Error(`Operation '${operation.operation_name}' declares '${tenantParam}'; add it to tenancy.unscoped_operations.`);
     }
   }
   const reserved = [`get_active_${tenancy.noun}`, `set_active_${tenancy.noun}`];
@@ -201,6 +212,9 @@ export function buildSchemaFromDiscoveryBundle(options: {
 
   const tenancy = overrides?.tenancy;
   if (tenancy) {
+    if (transport !== "http") {
+      throw new Error("Tenancy is supported only for HTTP upstreams.");
+    }
     validateTenancy(tenancy, operations);
     // The adapter chooses the tenant per call, so a captured static tenant header must not ride along.
     if (headers) {
@@ -341,6 +355,17 @@ npm run start
     schema.auth?.type === "bearer"
       ? `Set \`${schema.auth.token_env ?? "UPSTREAM_BEARER_TOKEN"}\` and run:`
       : "Run:";
+  // Header values of the form \${env:VAR} must be set before the first call; the tenancy start variable is optional.
+  const headerEnvVars = Object.entries(schema.headers ?? {})
+    .map(([name, value]) => [name, /^\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value)?.[1]] as const)
+    .filter((entry): entry is readonly [string, string] => Boolean(entry[1]));
+  const envLines = [
+    ...headerEnvVars.map(([name, variable]) => `- \`${variable}\` (required): sent as the \`${name}\` header.`),
+    ...(schema.tenancy?.default_env
+      ? [`- \`${schema.tenancy.default_env}\` (optional): starting ${schema.tenancy.noun}, by id or name.`]
+      : []),
+  ];
+  const envSection = envLines.length > 0 ? `\nAlso set:\n\n${envLines.join("\n")}\n` : "";
 
   return `## Running
 
@@ -349,7 +374,7 @@ Requires Node.js 20 or newer.
 Set \`MCPAQL_TARGET_BASE_URL\` if you want this adapter to connect to a different upstream server than the bundled \`${schema.target.base_url}\`.
 
 ${authLine}
-
+${envSection}
 \`\`\`bash
 npm install
 npm run start
