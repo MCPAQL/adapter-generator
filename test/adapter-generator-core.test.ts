@@ -163,3 +163,24 @@ test("adapter-generator-core emits native-applescript adapter server source", ()
   assert.match(schemaJson, /native-applescript:set_property:document\.title/);
   assert.match(schemaJson, /native-applescript:list_elements:project\.task/);
 });
+
+test("generated adapter resolves ${env:VAR} header values at connect time", () => {
+  const output = buildSchemaFromDiscoveryBundle({
+    bundle: syntheticBundle,
+    generatedAt: "2026-10-13T00:00:00.000Z",
+  });
+  const serverSource = generateAdapterPackage({ schema: output.schema, provenance: output.metadata })
+    .files.find((file) => file.path === "src/server.ts")?.content ?? "";
+  const fnSource = /function resolveHeaderValue[\s\S]*?\n}\n/.exec(serverSource)?.[0];
+  assert.ok(fnSource, "generated server should define resolveHeaderValue");
+
+  const js = ts.transpile(fnSource!, { target: ts.ScriptTarget.ES2022 });
+  const resolveHeaderValue = new Function("process", `${js}; return resolveHeaderValue;`)({
+    env: { FIXTURE_PROJECT_ID: "project_123" },
+  }) as (name: string, value: string) => string;
+
+  assert.equal(resolveHeaderValue("X-Project-Id", "${env:FIXTURE_PROJECT_ID}"), "project_123");
+  assert.equal(resolveHeaderValue("X-MCP-Toolsets", "all"), "all");
+  assert.equal(resolveHeaderValue("X-Partial", "prefix-${env:FIXTURE_PROJECT_ID}"), "prefix-${env:FIXTURE_PROJECT_ID}");
+  assert.throws(() => resolveHeaderValue("X-Project-Id", "${env:MISSING_VAR}"), /MISSING_VAR.*X-Project-Id/);
+});
