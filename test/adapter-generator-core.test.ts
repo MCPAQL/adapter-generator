@@ -272,6 +272,8 @@ test("generated HTTP adapters return compact results without per-call provenance
   assert.doesNotMatch(serverSource, /_meta: \{ provenance/);
   assert.doesNotMatch(serverSource, /JSON\.stringify\(payload, null, 2\)/);
   assert.match(serverSource, /text: JSON\.stringify\(payload\) \}/);
+});
+
 test("tenancy validation rejects unsafe configurations", () => {
   const withOwnedParam: DiscoveryBundle = {
     ...tenancyBundle,
