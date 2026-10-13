@@ -264,6 +264,16 @@ test("tenancy runtime is emitted only for tenant-scoped schemas and parses", () 
   assert.deepEqual(diagnostics?.map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n")), []);
 });
 
+test("generated HTTP adapters return compact results without per-call provenance", () => {
+  const output = buildSchemaFromDiscoveryBundle({ bundle: syntheticBundle });
+  const serverSource = generateAdapterPackage({ schema: output.schema, provenance: output.metadata })
+    .files.find((file) => file.path === "src/server.ts")?.content ?? "";
+  // Provenance stays in the package (src/provenance.json) for param mappings; it is not echoed per call.
+  assert.doesNotMatch(serverSource, /_meta: \{ provenance/);
+  assert.doesNotMatch(serverSource, /JSON\.stringify\(payload, null, 2\)/);
+  assert.match(serverSource, /text: JSON\.stringify\(payload\) \}/);
+});
+
 test("tenancy validation rejects unsafe configurations", () => {
   const withOwnedParam: DiscoveryBundle = {
     ...tenancyBundle,
