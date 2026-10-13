@@ -65,7 +65,34 @@ export interface DiscoveryBundle {
   };
 }
 
+/**
+ * Declares that the upstream scopes calls to a tenant (project, workspace, team) chosen
+ * by a request header. The generated adapter then lets the model list tenants, see and
+ * switch the active one, and target a tenant per call, instead of pinning one in config.
+ */
+export interface AdapterTenancy {
+  /** Upstream header that selects the tenant, e.g. "X-Project-Id". */
+  header: string;
+  /** Singular noun for generated names: "project" -> get_active_project, set_active_project, project_id. */
+  noun: string;
+  /** READ operation that lists the tenants the credential can reach. Called without the tenant header. */
+  list_operation: string;
+  /** Key of the array in the list operation's structured result. Defaults to "data". */
+  list_path?: string;
+  /** Field holding each tenant's id. */
+  id_field: string;
+  /** Field holding each tenant's display name. */
+  name_field: string;
+  /** Optional boolean field marking the account's default tenant. */
+  default_field?: string;
+  /** Optional env var naming the starting tenant (id or name). */
+  default_env?: string;
+  /** Operations that act account-wide or take the tenant as their own parameter; sent without the header. */
+  unscoped_operations?: string[];
+}
+
 export interface SchemaBuildOverrides {
+  tenancy?: AdapterTenancy;
   adapter?: {
     name?: string;
     version?: string;
@@ -141,6 +168,8 @@ export interface AdapterSchemaDocument {
    * builder; secrets are excluded by the redaction performed during interrogation.
    */
   headers?: Record<string, string>;
+  /** Present when the upstream is tenant-scoped; see AdapterTenancy. */
+  tenancy?: AdapterTenancy;
   operations: {
     create?: AdapterSchemaOperation[];
     read: AdapterSchemaOperation[];
