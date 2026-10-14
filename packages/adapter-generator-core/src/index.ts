@@ -1691,7 +1691,7 @@ export function generateAdapterPackage(options: {
   }
 
   const installSection = packageConfig && schema.target.transport !== "native-applescript"
-    ? `${buildInstallSection(schema, packageConfig)}\n`
+    ? buildInstallSection(schema, packageConfig)
     : "";
 
   return {
