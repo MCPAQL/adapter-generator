@@ -321,3 +321,50 @@ test("tenancy runtime keeps operation-owned tenant params and rejects non-string
   assert.match(source, /if \(!TENANT_PARAM_OPERATIONS\.has\(operationName\)\) return getActiveTenant\(\);/);
   assert.match(source, /VALIDATION_INVALID_PARAM_TYPE/);
 });
+
+test("package config emits a publishable package with a bin and install docs", () => {
+  const output = buildSchemaFromDiscoveryBundle({
+    bundle: { ...syntheticBundle, source: { ...syntheticBundle.source, capture_config_redacted: { transport: "streamable_http", headers: { "X-Region": "${env:FIXTURE_REGION}" } } } },
+  });
+  const adapterPackage = generateAdapterPackage({
+    schema: output.schema,
+    packageConfig: {
+      name: "@fixture/worker-adapter",
+      version: "1.2.3",
+      license: "AGPL-3.0-only",
+      repository: { url: "git+https://github.com/example/repo.git", directory: "adapter" },
+    },
+  });
+  const file = (name: string) => adapterPackage.files.find((entry) => entry.path === name)?.content ?? "";
+  const packageJson = JSON.parse(file("package.json")) as Record<string, unknown>;
+
+  assert.equal(adapterPackage.packageName, "@fixture/worker-adapter");
+  assert.equal(packageJson.private, undefined);
+  assert.equal(packageJson.version, "1.2.3");
+  assert.deepEqual(packageJson.bin, { "worker-adapter": "dist/server.js" });
+  assert.deepEqual(packageJson.files, ["dist", "README.md"]);
+  assert.deepEqual(packageJson.publishConfig, { access: "public" });
+  assert.deepEqual(packageJson.repository, { type: "git", url: "git+https://github.com/example/repo.git", directory: "adapter" });
+  assert.equal((packageJson.scripts as Record<string, string>).prepublishOnly, "npm run build");
+  assert.ok(file("src/server.ts").startsWith("#!/usr/bin/env node\n"));
+  assert.match(file("README.md"), /## Install/);
+  assert.match(file("README.md"), /claude mcp add worker-adapter -e FIXTURE_TOKEN=\.\.\. -e FIXTURE_REGION=\.\.\. -- npx -y @fixture\/worker-adapter/);
+  assert.match(file("README.md"), /"args": \[\n\s+"-y",\n\s+"@fixture\/worker-adapter"\n\s+\]/);
+});
+
+test("without package config the package stays private with no shebang", () => {
+  const output = buildSchemaFromDiscoveryBundle({ bundle: syntheticBundle });
+  const adapterPackage = generateAdapterPackage({ schema: output.schema });
+  const packageJson = JSON.parse(adapterPackage.files.find((entry) => entry.path === "package.json")?.content ?? "{}") as Record<string, unknown>;
+  assert.equal(packageJson.private, true);
+  assert.equal(packageJson.bin, undefined);
+  assert.doesNotMatch(adapterPackage.files.find((entry) => entry.path === "README.md")?.content ?? "", /## Install/);
+  assert.ok(!(adapterPackage.files.find((entry) => entry.path === "src/server.ts")?.content ?? "").startsWith("#!"));
+});
+
+test("package config rejects invalid names, bins, and versions", () => {
+  const { schema } = buildSchemaFromDiscoveryBundle({ bundle: syntheticBundle });
+  assert.throws(() => generateAdapterPackage({ schema, packageConfig: { name: "Bad Name" } }), /not a valid npm package name/);
+  assert.throws(() => generateAdapterPackage({ schema, packageConfig: { name: "@x/ok", bin: "rm -rf" } }), /package bin/);
+  assert.throws(() => generateAdapterPackage({ schema, packageConfig: { name: "@x/ok", version: "1.0" } }), /not a semver version/);
+});

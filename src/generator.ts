@@ -2,6 +2,7 @@ import path from "node:path";
 
 import {
   generateAdapterPackage as generateAdapterPackageContents,
+  type AdapterPackageConfig,
   type AdapterSchemaDocument,
   type TemplateOverridesDocument,
 } from "@mcpaql/adapter-generator-core";
@@ -12,6 +13,7 @@ export async function generateAdapterPackage(options: {
   schemaPath: string;
   provenancePath?: string;
   templatesPath?: string;
+  packagePath?: string;
   outDir: string;
 }): Promise<void> {
   const schema = await readJsonFile<AdapterSchemaDocument>(options.schemaPath);
@@ -21,8 +23,11 @@ export async function generateAdapterPackage(options: {
   const templates = options.templatesPath
     ? await readJsonFile<TemplateOverridesDocument>(options.templatesPath)
     : undefined;
+  const packageConfig = options.packagePath
+    ? await readJsonFile<AdapterPackageConfig>(options.packagePath)
+    : undefined;
   // Preserve supplied provenance verbatim; core only creates generated_at when it is absent.
-  const adapterPackage = generateAdapterPackageContents({ schema, provenance, templates });
+  const adapterPackage = generateAdapterPackageContents({ schema, provenance, templates, packageConfig });
 
   for (const file of adapterPackage.files) {
     await writeTextFile(path.join(options.outDir, file.path), file.content);

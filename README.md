@@ -64,3 +64,18 @@ The generated adapter then:
 - drops any captured static tenant header and keeps one upstream connection per tenant
 
 Schema build fails if the upstream is not HTTP, `list_operation` is not a READ operation or has required parameters, an operation that declares `<noun>_id` is not listed as unscoped, an unscoped operation is unknown, `noun` is not lowercase snake_case, or a generated operation name collides with an existing one. See `examples/generated/chief-mcp-projects` for a worked example.
+
+## Publishable packages
+
+Generated adapters are private workspace packages by default. Pass `--package <package-config.json>` to `generate-cli` (or `packageConfig` to `generateAdapterPackage`) to emit one that can be published to npm and run with `npx`:
+
+```json
+{
+  "name": "@mcpaql/chief-mcp",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "repository": { "url": "git+https://github.com/MCPAQL/examples.git", "directory": "generated/chief-mcp/adapter" }
+}
+```
+
+The package then gets a `bin` entry (named after the unscoped package name unless `bin` is set), `files: ["dist", "README.md"]`, public `publishConfig`, a `prepublishOnly` build, and a shebang on `src/server.ts`. `version` defaults to the schema version. The generated README gains an Install section with the MCP client config and a `claude mcp add` line, listing the env vars the adapter reads.
