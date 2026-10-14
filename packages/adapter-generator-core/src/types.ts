@@ -91,6 +91,25 @@ export interface AdapterTenancy {
   unscoped_operations?: string[];
 }
 
+/**
+ * npm package metadata for a generated adapter. When supplied, the package is
+ * emitted publishable (not private) with a runnable bin, instead of the default
+ * private workspace package.
+ */
+export interface AdapterPackageConfig {
+  /** Scoped or unscoped npm package name, e.g. "@mcpaql/chief-mcp". */
+  name: string;
+  /** Defaults to the schema version. */
+  version?: string;
+  description?: string;
+  /** Command name for the bin entry; defaults to the unscoped package name. */
+  bin?: string;
+  license?: string;
+  repository?: { url: string; directory?: string };
+  homepage?: string;
+  keywords?: string[];
+}
+
 export interface SchemaBuildOverrides {
   tenancy?: AdapterTenancy;
   adapter?: {

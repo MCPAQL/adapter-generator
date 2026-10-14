@@ -8,7 +8,7 @@ async function main(): Promise<void> {
 
   if (!input || !outDir) {
     throw new Error(
-      "Usage: mcpaql-generate-adapter --input <adapter-schema.json> --out <package-directory> [--provenance <adapter-provenance.json>] [--templates <templates.json>]",
+      "Usage: mcpaql-generate-adapter --input <adapter-schema.json> --out <package-directory> [--provenance <adapter-provenance.json>] [--templates <templates.json>] [--package <package-config.json>]",
     );
   }
 
@@ -16,6 +16,7 @@ async function main(): Promise<void> {
     schemaPath: input,
     provenancePath: args.provenance,
     templatesPath: args.templates,
+    packagePath: args.package,
     outDir,
   });
 

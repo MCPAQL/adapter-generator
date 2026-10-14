@@ -1,5 +1,6 @@
 import { TENANCY_RUNTIME } from "./tenancy-runtime.js";
 import type {
+  AdapterPackageConfig,
   AdapterSchemaDocument,
   AdapterSchemaOperation,
   AdapterTenancy,
@@ -13,6 +14,7 @@ import type {
 } from "./types.js";
 
 export type {
+  AdapterPackageConfig,
   AdapterSchemaDocument,
   AdapterSchemaOperation,
   AdapterTenancy,
@@ -295,8 +297,71 @@ function jsonContent(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-function packageName(schema: AdapterSchemaDocument): string {
-  return `@mcpaql/generated-${schema.name}`;
+function packageName(schema: AdapterSchemaDocument, config?: AdapterPackageConfig): string {
+  return config?.name ?? `@mcpaql/generated-${schema.name}`;
+}
+
+const NPM_PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+const BIN_NAME = /^[a-z0-9][a-z0-9._-]*$/;
+
+function binName(config: AdapterPackageConfig): string {
+  return config.bin ?? config.name.slice(config.name.lastIndexOf("/") + 1);
+}
+
+function validatePackageConfig(config: AdapterPackageConfig): void {
+  if (typeof config.name !== "string" || config.name.length > 214 || !NPM_PACKAGE_NAME.test(config.name)) {
+    throw new Error(`package name '${String(config.name)}' is not a valid npm package name`);
+  }
+  if (!BIN_NAME.test(binName(config))) {
+    throw new Error(`package bin '${binName(config)}' must be lowercase letters, digits, '.', '_' or '-'`);
+  }
+  if (config.version !== undefined && !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(config.version)) {
+    throw new Error(`package version '${config.version}' is not a semver version`);
+  }
+}
+
+/** Env vars a generated HTTP adapter reads: [variable, required, description]. */
+function adapterEnvVars(schema: AdapterSchemaDocument): Array<[string, boolean, string]> {
+  const vars: Array<[string, boolean, string]> = [];
+  if (schema.auth?.type === "bearer") {
+    vars.push([schema.auth.token_env ?? "UPSTREAM_BEARER_TOKEN", true, "upstream API token"]);
+  }
+  for (const [name, value] of Object.entries(schema.headers ?? {})) {
+    const variable = /^\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value)?.[1];
+    if (variable) vars.push([variable, true, `sent as the \`${name}\` header`]);
+  }
+  if (schema.tenancy?.default_env) {
+    vars.push([schema.tenancy.default_env, false, `starting ${schema.tenancy.noun}, by id or name`]);
+  }
+  return vars;
+}
+
+function buildInstallSection(schema: AdapterSchemaDocument, config: AdapterPackageConfig): string {
+  const vars = adapterEnvVars(schema);
+  const env = Object.fromEntries(vars.filter(([, required]) => required).map(([variable]) => [variable, "..."]));
+  const serverKey = binName(config);
+  const clientConfig = JSON.stringify(
+    { mcpServers: { [serverKey]: { command: "npx", args: ["-y", config.name], ...(Object.keys(env).length > 0 ? { env } : {}) } } },
+    null,
+    2,
+  );
+  const claudeEnv = Object.keys(env).map((variable) => `-e ${variable}=... `).join("");
+  const varLines = vars.map(([variable, required, description]) => `- \`${variable}\` (${required ? "required" : "optional"}): ${description}.`);
+  return `## Install
+
+Add the adapter to any MCP client; \`npx\` downloads and runs it, with nothing to clone or build:
+
+\`\`\`json
+${clientConfig}
+\`\`\`
+
+Or, in Claude Code:
+
+\`\`\`bash
+claude mcp add ${serverKey} ${claudeEnv}-- npx -y ${config.name}
+\`\`\`
+${varLines.length > 0 ? `\n${varLines.join("\n")}\n` : ""}
+`;
 }
 
 function prettyToolName(name: string): string {
@@ -1537,8 +1602,14 @@ export function generateAdapterPackage(options: {
   provenance?: Record<string, unknown>;
   generatedAt?: string;
   templates?: TemplateOverridesDocument;
+  /** npm metadata; when present the package is emitted publishable with a bin. */
+  packageConfig?: AdapterPackageConfig;
 }): AdapterPackageContents {
   let schema = options.schema;
+  const packageConfig = options.packageConfig;
+  if (packageConfig) {
+    validatePackageConfig(packageConfig);
+  }
   const provenance = options.provenance ?? { generated_at: options.generatedAt ?? new Date().toISOString() };
   if (schema.target.transport === "native-applescript" && !schema.target.application) {
     throw new Error("native-applescript adapter schema requires target.application");
@@ -1551,15 +1622,33 @@ export function generateAdapterPackage(options: {
     schema = applyTemplatesToSchema(schema, options.templates!);
   }
 
-  const serverSource = schema.target.transport === "native-applescript"
+  const baseServerSource = schema.target.transport === "native-applescript"
     ? buildNativeAppleScriptServerSource(schema, hasTemplates)
     : buildServerSource(schema);
+  // A bin entry needs a shebang; tsc carries it through to dist/server.js.
+  const serverSource = packageConfig ? `#!/usr/bin/env node\n${baseServerSource}` : baseServerSource;
 
   const dependencies: Record<string, string> = { "@modelcontextprotocol/sdk": "^1.27.1" };
 
+  const publishFields = packageConfig
+    ? {
+        version: packageConfig.version ?? schema.version,
+        description: packageConfig.description ?? schema.description,
+        license: packageConfig.license,
+        repository: packageConfig.repository
+          ? { type: "git", url: packageConfig.repository.url, directory: packageConfig.repository.directory }
+          : undefined,
+        homepage: packageConfig.homepage,
+        keywords: packageConfig.keywords,
+        bin: { [binName(packageConfig)]: "dist/server.js" },
+        files: ["dist", "README.md"],
+        publishConfig: { access: "public" },
+      }
+    : { private: true };
+
   const packageJson = {
-    name: packageName(schema),
-    private: true,
+    name: packageName(schema, packageConfig),
+    ...publishFields,
     type: "module",
     engines: {
       node: ">=20",
@@ -1567,6 +1656,7 @@ export function generateAdapterPackage(options: {
     scripts: {
       build: "tsc -p tsconfig.json",
       start: "tsx src/server.ts",
+      ...(packageConfig ? { prepublishOnly: "npm run build" } : {}),
     },
     dependencies,
     devDependencies: {
@@ -1600,8 +1690,12 @@ export function generateAdapterPackage(options: {
     files.push({ path: "src/templates.json", content: jsonContent(options.templates!.templates) });
   }
 
+  const installSection = packageConfig && schema.target.transport !== "native-applescript"
+    ? `${buildInstallSection(schema, packageConfig)}\n`
+    : "";
+
   return {
-    packageName: packageName(schema),
+    packageName: packageName(schema, packageConfig),
     files: [
       ...files,
       { path: "package.json", content: jsonContent(packageJson) },
@@ -1609,7 +1703,7 @@ export function generateAdapterPackage(options: {
       { path: "src/server.ts", content: serverSource },
       {
         path: "README.md",
-        content: `# ${prettyToolName(schema.name)}\n\nGenerated MCP-AQL adapter package for ${adapterReadmeSubject(schema.description)}.\n\n## Supported Endpoints\n\n${buildEndpointDescriptions(schema)}\n\n${buildRunningSection(schema)}`,
+        content: `# ${prettyToolName(schema.name)}\n\nGenerated MCP-AQL adapter package for ${adapterReadmeSubject(schema.description)}.\n\n## Supported Endpoints\n\n${buildEndpointDescriptions(schema)}\n\n${installSection}${buildRunningSection(schema)}`,
       },
     ],
   };
