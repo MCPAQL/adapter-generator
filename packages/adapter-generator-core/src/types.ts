@@ -110,8 +110,29 @@ export interface AdapterPackageConfig {
   keywords?: string[];
 }
 
+/**
+ * How a generated adapter launches a local stdio upstream. The adapter spawns the
+ * command lazily on the first call and keeps the child for the life of the adapter,
+ * so upstream sessions persist across calls.
+ */
+export interface AdapterStdioTarget {
+  /** Executable to spawn, e.g. "npx". Pin package versions in args, never `@latest`. */
+  command: string;
+  args?: string[];
+  cwd?: string;
+  /**
+   * Names of adapter environment variables copied into the child. The child otherwise
+   * receives only the SDK's minimal default environment, never the full parent environment.
+   */
+  env_passthrough?: string[];
+  /** Fixed child environment values; a value of the exact form "${env:VAR}" is read from the adapter's environment. */
+  env?: Record<string, string>;
+}
+
 export interface SchemaBuildOverrides {
   tenancy?: AdapterTenancy;
+  /** Replaces or completes the captured stdio launch config, e.g. to pin an exact upstream version. */
+  stdio?: Partial<AdapterStdioTarget>;
   adapter?: {
     name?: string;
     version?: string;
@@ -166,11 +187,13 @@ export interface AdapterSchemaDocument {
   description: string;
   target: {
     base_url: string;
-    transport: "http" | "native-applescript";
+    transport: "http" | "native-applescript" | "stdio";
     protocol: "custom";
     serialization: "json";
     /** The macOS application name (for native-applescript transport). */
     application?: string;
+    /** Child process launch config (for stdio transport). */
+    stdio?: AdapterStdioTarget;
   };
   auth?: {
     type: "bearer";

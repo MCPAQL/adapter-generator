@@ -3,6 +3,7 @@ import type {
   AdapterPackageConfig,
   AdapterSchemaDocument,
   AdapterSchemaOperation,
+  AdapterStdioTarget,
   AdapterTenancy,
   DiscoveryBundle,
   DiscoveryOperation,
@@ -17,6 +18,7 @@ export type {
   AdapterPackageConfig,
   AdapterSchemaDocument,
   AdapterSchemaOperation,
+  AdapterStdioTarget,
   AdapterTenancy,
   DangerLevel,
   DiscoveryBundle,
@@ -178,6 +180,73 @@ function toSchemaOperation(operation: DiscoveryOperation): AdapterSchemaOperatio
   };
 }
 
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const REDACTED = "<redacted>";
+
+function stringArray(value: unknown, label: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new Error(`stdio ${label} must be an array of strings.`);
+  }
+  return value as string[];
+}
+
+// Each launch field comes from overrides when set, otherwise from the capture, so an override
+// can pin args (e.g. an exact package version) without restating the command. An override
+// replaces a whole field: overrides.stdio.env replaces the captured env, it is not merged per key.
+function resolveStdioTarget(
+  captured: Record<string, unknown> | undefined,
+  override: Partial<AdapterStdioTarget> | undefined,
+): AdapterStdioTarget {
+  const pick = (field: keyof AdapterStdioTarget): unknown =>
+    override && override[field] !== undefined ? override[field] : captured?.[field];
+
+  const command = pick("command");
+  if (typeof command !== "string" || command.trim() === "") {
+    throw new Error("stdio transport requires a command (capture config or overrides.stdio.command).");
+  }
+  const args = stringArray(pick("args"), "args");
+  const cwdValue = pick("cwd");
+  if (cwdValue !== undefined && typeof cwdValue !== "string") {
+    throw new Error("stdio cwd must be a string.");
+  }
+  const cwd = cwdValue as string | undefined;
+  const envPassthrough = stringArray(pick("env_passthrough"), "env_passthrough");
+  const envValue = pick("env");
+  if (envValue !== undefined && (envValue === null || typeof envValue !== "object" || Array.isArray(envValue))) {
+    throw new Error("stdio env must be an object of string values.");
+  }
+  const env = envValue as Record<string, unknown> | undefined;
+
+  for (const name of [...(envPassthrough ?? []), ...Object.keys(env ?? {})]) {
+    if (!ENV_NAME_PATTERN.test(name)) throw new Error(`Invalid stdio environment variable name '${name}'.`);
+  }
+  for (const [name, value] of Object.entries(env ?? {})) {
+    if (typeof value !== "string") throw new Error(`stdio env value for '${name}' must be a string.`);
+  }
+  // Discovery redacts secret-looking launch values. Launching with the placeholder would fail
+  // upstream auth with no hint, so require the value to be supplied explicitly instead.
+  const redacted = [
+    ...(command.includes(REDACTED) ? ["command"] : []),
+    ...(args ?? []).flatMap((arg, index) => (arg.includes(REDACTED) ? [`args[${index}]`] : [])),
+    ...Object.entries(env ?? {}).flatMap(([name, value]) => (String(value).includes(REDACTED) ? [`env.${name}`] : [])),
+  ];
+  if (redacted.length > 0) {
+    throw new Error(
+      `stdio launch config contains redacted values (${redacted.join(", ")}). Supply them in overrides.stdio, `
+      + "using \"${env:VAR}\" references for secrets so they are read at spawn time and never written into the schema.",
+    );
+  }
+
+  return {
+    command,
+    ...(args && args.length > 0 ? { args } : {}),
+    ...(cwd ? { cwd } : {}),
+    ...(envPassthrough && envPassthrough.length > 0 ? { env_passthrough: envPassthrough } : {}),
+    ...(env && Object.keys(env).length > 0 ? { env: env as Record<string, string> } : {}),
+  };
+}
+
 function endpointKey(endpoint: DiscoveryOperation["endpoint"]): keyof AdapterSchemaDocument["operations"] {
   return ENDPOINT_KEY_BY_CATEGORY[endpoint];
 }
@@ -198,12 +267,25 @@ export function buildSchemaFromDiscoveryBundle(options: {
   const captureConfig = bundle.source.capture_config_redacted;
   const isNativeTransport = captureConfig?.transport === "native-applescript"
     || bundle.source.server_url.startsWith("native-applescript://");
-  const transport: "http" | "native-applescript" = isNativeTransport ? "native-applescript" : "http";
+  // Interrogation configs record transport as { type, ...launch fields }; hand-written captures may use a bare string.
+  const transportConfig = captureConfig?.transport && typeof captureConfig.transport === "object" && !Array.isArray(captureConfig.transport)
+    ? captureConfig.transport as Record<string, unknown>
+    : undefined;
+  const isStdioTransport = !isNativeTransport
+    && (captureConfig?.transport === "stdio" || transportConfig?.type === "stdio" || bundle.source.server_url.startsWith("stdio://"));
+  const transport: AdapterSchemaDocument["target"]["transport"] = isNativeTransport
+    ? "native-applescript"
+    : isStdioTransport ? "stdio" : "http";
+  if (overrides?.stdio && !isStdioTransport) {
+    throw new Error("overrides.stdio applies only to stdio upstreams.");
+  }
   const application = isNativeTransport
     ? (captureConfig?.application as string | undefined) ?? bundle.source.server?.name
     : undefined;
+  const stdio = isStdioTransport ? resolveStdioTarget(transportConfig ?? captureConfig, overrides?.stdio) : undefined;
 
-  const capturedHeaders = captureConfig?.headers;
+  // Request headers exist only on HTTP upstreams.
+  const capturedHeaders = isStdioTransport ? undefined : captureConfig?.headers;
   const headers: Record<string, string> | undefined =
     capturedHeaders && typeof capturedHeaders === "object" && !Array.isArray(capturedHeaders)
       ? Object.fromEntries(
@@ -239,9 +321,10 @@ export function buildSchemaFromDiscoveryBundle(options: {
       protocol: "custom",
       serialization: "json",
       ...(application ? { application } : {}),
+      ...(stdio ? { stdio } : {}),
     },
     auth:
-      bundle.source.auth.type === "bearer"
+      bundle.source.auth.type === "bearer" && !isStdioTransport
         ? {
             type: "bearer",
             header: "Authorization",
@@ -289,7 +372,16 @@ export function buildSchemaFromDiscoveryBundle(options: {
         };
       }),
     },
-    warnings: bundle.normalized_bundle.warnings,
+    warnings: isStdioTransport && bundle.source.auth.type === "bearer"
+      ? [
+          ...bundle.normalized_bundle.warnings,
+          {
+            code: "STDIO_AUTH_IGNORED",
+            severity: "warning",
+            message: "Bearer auth does not apply to stdio upstreams and was dropped; pass credentials with overrides.stdio.env \"${env:VAR}\" references or env_passthrough.",
+          },
+        ]
+      : bundle.normalized_bundle.warnings,
   };
 }
 
@@ -320,7 +412,7 @@ function validatePackageConfig(config: AdapterPackageConfig): void {
   }
 }
 
-/** Env vars a generated HTTP adapter reads: [variable, required, description]. */
+/** Env vars a generated adapter reads: [variable, required, description]. */
 function adapterEnvVars(schema: AdapterSchemaDocument): Array<[string, boolean, string]> {
   const vars: Array<[string, boolean, string]> = [];
   if (schema.auth?.type === "bearer") {
@@ -332,6 +424,13 @@ function adapterEnvVars(schema: AdapterSchemaDocument): Array<[string, boolean, 
   }
   if (schema.tenancy?.default_env) {
     vars.push([schema.tenancy.default_env, false, `starting ${schema.tenancy.noun}, by id or name`]);
+  }
+  for (const [name, value] of Object.entries(schema.target.stdio?.env ?? {})) {
+    const variable = /^\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value)?.[1];
+    if (variable) vars.push([variable, true, `passed to the upstream as \`${name}\``]);
+  }
+  for (const name of schema.target.stdio?.env_passthrough ?? []) {
+    vars.push([name, false, "passed through to the upstream process"]);
   }
   return vars;
 }
@@ -413,6 +512,30 @@ npm run start
 \`\`\`
 
 > **Note:** The target application (${schema.target.application ?? "the configured app"}) must be running for most operations to succeed.
+`;
+  }
+
+  if (schema.target.transport === "stdio" && schema.target.stdio) {
+    const launch = [schema.target.stdio.command, ...(schema.target.stdio.args ?? [])].join(" ");
+    const varLines = adapterEnvVars(schema).map(
+      ([variable, required, description]) => `- \`${variable}\` (${required ? "required" : "optional"}): ${description}.`,
+    );
+    return `## Running
+
+Requires Node.js 20 or newer.
+
+On the first call, this adapter starts its upstream MCP server as a child process and keeps it running:
+
+\`\`\`bash
+${launch}
+\`\`\`
+
+The child receives a minimal environment (the MCP SDK default) plus only the variables listed below. Its stderr goes to the adapter's stderr.
+${varLines.length > 0 ? `\n${varLines.join("\n")}\n` : ""}
+\`\`\`bash
+npm install
+npm run start
+\`\`\`
 `;
   }
 
@@ -935,114 +1058,8 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 `;
 }
 
-function buildServerSource(schema: AdapterSchemaDocument): string {
-  const tenancy = Boolean(schema.tenancy);
-  return `import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import type {
-  CallToolRequest,
-  CallToolResult,
-  ListToolsResult,
-} from "@modelcontextprotocol/sdk/types.js";
-import rawSchema from "./schema.json" with { type: "json" };
-import provenance from "./provenance.json" with { type: "json" };
-
-type EndpointKey = "create" | "read" | "update" | "delete" | "execute";
-type EndpointName = "CREATE" | "READ" | "UPDATE" | "DELETE" | "EXECUTE";
-type OperationParam = {
-  type: string;
-  required?: boolean;
-  description?: string;
-  default?: unknown;
-  enum?: string[];
-  minimum?: number;
-  maximum?: number;
-  pattern?: string;
-  format?: string;
-};
-type OperationDefinition = {
-  name: string;
-  maps_to: string;
-  description: string;
-  params?: Record<string, OperationParam>;
-  response?: {
-    type?: "object";
-    description?: string;
-  };
-  danger_level?: string;
-  requires_confirmation?: boolean;
-  non_idempotent?: boolean;
-};
-type AdapterSchema = {
-  name: string;
-  version: string;
-  description: string;
-  target: {
-    base_url: string;
-    transport: string;
-    protocol: string;
-    serialization: string;
-  };
-  auth?: {
-    type: "bearer";
-    header?: string;
-    prefix?: string;
-    token_env?: string;
-  };
-  headers?: Record<string, string>;
-  operations: Partial<Record<EndpointKey, OperationDefinition[]>>;
-};
-type OperationIndexEntry = {
-  endpoint: EndpointName;
-  definition: OperationDefinition;
-};
-type AdapterProvenance = {
-  operations?: Array<{
-    operation_name: string;
-    param_mappings?: Record<string, string>;
-  }>;
-};
-type OperationArguments = Record<string, unknown> & {
-  operation?: unknown;
-  params?: unknown;
-};
-
-const schema = rawSchema as unknown as AdapterSchema;
-// Provenance is generated by the schema builder; this is a read-side projection of the broader metadata shape.
-const adapterProvenance = provenance as unknown as AdapterProvenance;
-${tenancy ? TENANCY_RUNTIME : ""}
-const TOOL_NAME_BY_ENDPOINT: Record<EndpointName, string> = {
-  CREATE: "mcp_aql_create",
-  READ: "mcp_aql_read",
-  UPDATE: "mcp_aql_update",
-  DELETE: "mcp_aql_delete",
-  EXECUTE: "mcp_aql_execute",
-};
-
-const TOOL_BY_OPERATION = new Map<string, OperationIndexEntry>();
-for (const [endpoint, operations] of Object.entries(schema.operations) as Array<[EndpointKey, OperationDefinition[] | undefined]>) {
-  for (const operation of operations ?? []) {
-    TOOL_BY_OPERATION.set(operation.name, {
-      endpoint: endpoint.toUpperCase() as EndpointName,
-      definition: operation,
-    });
-  }
-}
-
-const PARAM_MAPPINGS_BY_OPERATION = new Map<string, Record<string, string>>();
-for (const entry of adapterProvenance.operations ?? []) {
-  if (entry.param_mappings && Object.keys(entry.param_mappings).length > 0) {
-    PARAM_MAPPINGS_BY_OPERATION.set(entry.operation_name, entry.param_mappings);
-  }
-}
-
-let upstreamClient: Client | undefined;
+/** Emitted upstream runtime for streamable-HTTP adapters: bearer auth, captured headers, base URL override. */
+const HTTP_UPSTREAM_RUNTIME = `let upstreamClient: Client | undefined;
 let upstreamTransport: StreamableHTTPClientTransport | undefined;
 
 function textResult(payload: unknown): CallToolResult {
@@ -1127,7 +1144,243 @@ async function getUpstreamClient(): Promise<Client> {
   upstreamTransport = transport;
   return upstreamClient;
 }
+`;
 
+/**
+ * Emitted upstream runtime for stdio adapters. The child is spawned lazily and kept
+ * for the life of the adapter so upstream session state survives across calls. Its
+ * environment is the SDK's minimal default plus explicitly declared variables, and
+ * its stderr goes to the adapter's stderr, never into tool results. If the child
+ * exits unexpectedly, the next call reports that once (session state is gone) and
+ * the call after that starts a fresh child.
+ */
+const STDIO_UPSTREAM_RUNTIME = `let upstreamClient: Client | undefined;
+let upstreamTransport: StdioClientTransport | undefined;
+let upstreamConnecting: Promise<Client> | undefined;
+let startingTransport: StdioClientTransport | undefined;
+let upstreamExitNotice: string | undefined;
+let closingUpstream = false;
+
+function textResult(payload: unknown): CallToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(payload) }],
+  };
+}
+
+function resolveStdioTarget(): NonNullable<AdapterSchema["target"]["stdio"]> {
+  const stdio = schema.target.stdio;
+  if (!stdio?.command) {
+    throw new Error("stdio schema is missing target.stdio.command");
+  }
+  return stdio;
+}
+
+// A configured value of the exact form "\${env:VAR_NAME}" is read from the adapter's
+// environment at spawn time, so secrets never have to be committed in the schema.
+function resolveChildEnvValue(name: string, value: string): string {
+  const match = /^\\$\\{env:([A-Za-z_][A-Za-z0-9_]*)\\}$/.exec(value);
+  if (!match) {
+    return value;
+  }
+  const resolved = process.env[match[1]];
+  if (resolved === undefined) {
+    throw new Error(\`Missing env var '\${match[1]}' for upstream environment variable '\${name}'.\`);
+  }
+  return resolved;
+}
+
+function buildChildEnvironment(): Record<string, string> {
+  const stdio = resolveStdioTarget();
+  const env: Record<string, string> = { ...getDefaultEnvironment() };
+  for (const name of stdio.env_passthrough ?? []) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  for (const [name, value] of Object.entries(stdio.env ?? {})) {
+    env[name] = resolveChildEnvValue(name, value);
+  }
+  return env;
+}
+
+// Concurrent first calls share one in-flight connection, so the adapter never runs two children.
+async function getUpstreamClient(): Promise<Client> {
+  if (upstreamClient) {
+    return upstreamClient;
+  }
+  if (upstreamConnecting) {
+    return upstreamConnecting;
+  }
+  if (upstreamExitNotice) {
+    const notice = upstreamExitNotice;
+    upstreamExitNotice = undefined;
+    throw new Error(notice);
+  }
+  upstreamConnecting = connectUpstream().finally(() => {
+    upstreamConnecting = undefined;
+  });
+  return upstreamConnecting;
+}
+
+async function connectUpstream(): Promise<Client> {
+  const stdio = resolveStdioTarget();
+  const transport = new StdioClientTransport({
+    command: stdio.command,
+    args: stdio.args ?? [],
+    cwd: stdio.cwd,
+    env: buildChildEnvironment(),
+    stderr: "inherit",
+  });
+  const client = new Client({ name: schema.name, version: schema.version });
+  client.onclose = () => {
+    if (upstreamClient !== client) return;
+    upstreamClient = undefined;
+    upstreamTransport = undefined;
+    if (!closingUpstream) {
+      upstreamExitNotice = "The upstream process exited and its session state was lost. Retry to start a fresh upstream.";
+    }
+  };
+  startingTransport = transport;
+  try {
+    await client.connect(transport);
+  } catch (error) {
+    await transport.close();
+    throw error;
+  } finally {
+    startingTransport = undefined;
+  }
+  // Shutdown may have started while the child was starting; it could not see this transport yet.
+  if (closingUpstream) {
+    await transport.close();
+    throw new Error("The adapter is shutting down.");
+  }
+  upstreamClient = client;
+  upstreamTransport = transport;
+  return upstreamClient;
+}
+`;
+
+function buildServerSource(schema: AdapterSchemaDocument): string {
+  const tenancy = Boolean(schema.tenancy);
+  const stdio = schema.target.transport === "stdio";
+  if (stdio && !schema.target.stdio?.command) {
+    throw new Error("stdio adapter schema requires target.stdio.command");
+  }
+  const upstreamImport = stdio
+    ? `import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";`
+    : `import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";`;
+  return `import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+${upstreamImport}
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import type {
+  CallToolRequest,
+  CallToolResult,
+  ListToolsResult,
+} from "@modelcontextprotocol/sdk/types.js";
+import rawSchema from "./schema.json" with { type: "json" };
+import provenance from "./provenance.json" with { type: "json" };
+
+type EndpointKey = "create" | "read" | "update" | "delete" | "execute";
+type EndpointName = "CREATE" | "READ" | "UPDATE" | "DELETE" | "EXECUTE";
+type OperationParam = {
+  type: string;
+  required?: boolean;
+  description?: string;
+  default?: unknown;
+  enum?: string[];
+  minimum?: number;
+  maximum?: number;
+  pattern?: string;
+  format?: string;
+};
+type OperationDefinition = {
+  name: string;
+  maps_to: string;
+  description: string;
+  params?: Record<string, OperationParam>;
+  response?: {
+    type?: "object";
+    description?: string;
+  };
+  danger_level?: string;
+  requires_confirmation?: boolean;
+  non_idempotent?: boolean;
+};
+type AdapterSchema = {
+  name: string;
+  version: string;
+  description: string;
+  target: {
+    base_url: string;
+    transport: string;
+    protocol: string;
+    serialization: string;
+    stdio?: {
+      command: string;
+      args?: string[];
+      cwd?: string;
+      env_passthrough?: string[];
+      env?: Record<string, string>;
+    };
+  };
+  auth?: {
+    type: "bearer";
+    header?: string;
+    prefix?: string;
+    token_env?: string;
+  };
+  headers?: Record<string, string>;
+  operations: Partial<Record<EndpointKey, OperationDefinition[]>>;
+};
+type OperationIndexEntry = {
+  endpoint: EndpointName;
+  definition: OperationDefinition;
+};
+type AdapterProvenance = {
+  operations?: Array<{
+    operation_name: string;
+    param_mappings?: Record<string, string>;
+  }>;
+};
+type OperationArguments = Record<string, unknown> & {
+  operation?: unknown;
+  params?: unknown;
+};
+
+const schema = rawSchema as unknown as AdapterSchema;
+// Provenance is generated by the schema builder; this is a read-side projection of the broader metadata shape.
+const adapterProvenance = provenance as unknown as AdapterProvenance;
+${tenancy ? TENANCY_RUNTIME : ""}
+const TOOL_NAME_BY_ENDPOINT: Record<EndpointName, string> = {
+  CREATE: "mcp_aql_create",
+  READ: "mcp_aql_read",
+  UPDATE: "mcp_aql_update",
+  DELETE: "mcp_aql_delete",
+  EXECUTE: "mcp_aql_execute",
+};
+
+const TOOL_BY_OPERATION = new Map<string, OperationIndexEntry>();
+for (const [endpoint, operations] of Object.entries(schema.operations) as Array<[EndpointKey, OperationDefinition[] | undefined]>) {
+  for (const operation of operations ?? []) {
+    TOOL_BY_OPERATION.set(operation.name, {
+      endpoint: endpoint.toUpperCase() as EndpointName,
+      definition: operation,
+    });
+  }
+}
+
+const PARAM_MAPPINGS_BY_OPERATION = new Map<string, Record<string, string>>();
+for (const entry of adapterProvenance.operations ?? []) {
+  if (entry.param_mappings && Object.keys(entry.param_mappings).length > 0) {
+    PARAM_MAPPINGS_BY_OPERATION.set(entry.operation_name, entry.param_mappings);
+  }
+}
+
+${stdio ? STDIO_UPSTREAM_RUNTIME : HTTP_UPSTREAM_RUNTIME}
 function resolveParams(args: OperationArguments | undefined): Record<string, unknown> {
   if (args && typeof args.params === "object" && args.params !== null && !Array.isArray(args.params)) {
     return args.params as Record<string, unknown>;
@@ -1367,7 +1620,18 @@ ${tenancy ? `  let tenant: TenantRef | undefined;
     return tenancyErrorResult(error);
   }
   const upstream = await getTenantClient(tenant?.id);
-  const tenantMeta = tenant ? { [TENANCY.noun]: { id: tenant.id, name: tenant.name, source: tenant.source } } : {};` : `  const upstream = await getUpstreamClient();`}
+  const tenantMeta = tenant ? { [TENANCY.noun]: { id: tenant.id, name: tenant.name, source: tenant.source } } : {};` : `  let upstream: Client;
+  try {
+    upstream = await getUpstreamClient();
+  } catch (error) {
+    return {
+      success: false,
+      error: {
+        code: "UPSTREAM_UNAVAILABLE",
+        message: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }`}
   const sourceTool = item.definition.maps_to.replace(/^tool:/, "");
   const upstreamParams = mapParamsToUpstream(operationName, params);
   const result = await upstream.callTool({
@@ -1463,21 +1727,31 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 
 async function closeUpstreamTransport() {
-${tenancy ? "  await closeTenantClients();\n" : ""}  if (upstreamTransport) {
+${tenancy ? "  await closeTenantClients();\n" : ""}${stdio ? "  closingUpstream = true;\n  // A child still starting is not yet upstreamTransport; stop it too so it is never orphaned.\n  await startingTransport?.close();\n" : ""}  if (upstreamTransport) {
     await upstreamTransport.close();
     upstreamTransport = undefined;
     upstreamClient = undefined;
   }
 }
 
+let shuttingDown = false;
+function shutdown(): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  void closeUpstreamTransport().finally(() => process.exit(0));
+}
+
 process.on("beforeExit", async () => {
   await closeUpstreamTransport();
 });
 
+// A host may end the session by closing the adapter's stdin without a signal. An open
+// upstream connection keeps the event loop alive, so beforeExit alone would never fire.
+server.onclose = shutdown;
+process.stdin.on("end", shutdown);
+
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => {
-    void closeUpstreamTransport().finally(() => process.exit(0));
-  });
+  process.on(signal, shutdown);
 }
 `;
 }
