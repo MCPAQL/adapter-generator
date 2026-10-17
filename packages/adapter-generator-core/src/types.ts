@@ -131,6 +131,12 @@ export interface AdapterStdioTarget {
 
 export interface SchemaBuildOverrides {
   tenancy?: AdapterTenancy;
+  /**
+   * Endpoints whose operations are left out of the adapter entirely (after per-operation
+   * endpoint overrides apply), e.g. ["EXECUTE"] to ship a staged adapter with no runtime
+   * operations. Excluded operations are recorded in metadata.excluded_operations.
+   */
+  exclude_endpoints?: EndpointCategory[];
   /** Replaces or completes the captured stdio launch config, e.g. to pin an exact upstream version. */
   stdio?: Partial<AdapterStdioTarget>;
   adapter?: {
@@ -149,6 +155,10 @@ export interface SchemaBuildOverrides {
       description?: string;
       needs_review?: boolean;
       review_reason?: string;
+      /** Leave this operation out of the adapter; it is not listed, introspectable or callable. */
+      exclude?: boolean;
+      /** Recorded with the exclusion in metadata.excluded_operations. */
+      exclude_reason?: string;
     }
   >;
 }
@@ -230,6 +240,13 @@ export interface SchemaBuildOutput {
     source_capture_name: string;
     warning_count: number;
     operation_count: number;
+    /** Operations in the bundle that overrides left out of the adapter. */
+    excluded_operations?: Array<{
+      source_tool_name: string;
+      operation_name: string;
+      endpoint: EndpointCategory;
+      reason: string;
+    }>;
     operations: Array<{
       source_tool_name: string;
       operation_name: string;

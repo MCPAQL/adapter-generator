@@ -54,6 +54,11 @@ const VALID_ENDPOINTS = new Set(["CREATE", "READ", "UPDATE", "DELETE", "EXECUTE"
 const VALID_DANGER_LEVELS = new Set(["safe", "reversible", "destructive", "dangerous"]);
 
 function validateOverrides(overrides?: SchemaBuildOverrides): void {
+  for (const endpoint of overrides?.exclude_endpoints ?? []) {
+    if (!VALID_ENDPOINTS.has(endpoint)) {
+      throw new Error(`Invalid exclude_endpoints entry '${endpoint}'.`);
+    }
+  }
   if (!overrides?.operations) {
     return;
   }
@@ -260,7 +265,24 @@ export function buildSchemaFromDiscoveryBundle(options: {
   const overrides = options.overrides;
   validateOverrides(overrides);
 
-  const operations = bundle.normalized_bundle.operations.map((operation) => applyOverrides(operation, overrides?.operations));
+  const overridden = bundle.normalized_bundle.operations.map((operation) => applyOverrides(operation, overrides?.operations));
+  const excludedEndpoints = new Set(overrides?.exclude_endpoints ?? []);
+  const excludedOperations: NonNullable<SchemaBuildOutput["metadata"]["excluded_operations"]> = [];
+  const operations = overridden.filter((operation, index) => {
+    const source = bundle.normalized_bundle.operations[index];
+    const override = overrides?.operations?.[source.source_tool_name] ?? overrides?.operations?.[source.operation_name];
+    const reason = override?.exclude
+      ? override.exclude_reason ?? "excluded by operation override"
+      : excludedEndpoints.has(operation.endpoint) ? `endpoint ${operation.endpoint} excluded by exclude_endpoints` : undefined;
+    if (!reason) return true;
+    excludedOperations.push({
+      source_tool_name: operation.source_tool_name,
+      operation_name: operation.operation_name,
+      endpoint: operation.endpoint,
+      reason,
+    });
+    return false;
+  });
   const adapterName = overrides?.adapter?.name ?? `${bundle.source.name}-adapter`;
   const tokenEnv = overrides?.adapter?.token_env ?? bundle.source.auth.token_env;
 
@@ -355,6 +377,7 @@ export function buildSchemaFromDiscoveryBundle(options: {
       source_capture_name: bundle.source.name,
       warning_count: bundle.normalized_bundle.warnings.length,
       operation_count: operations.length,
+      ...(excludedOperations.length > 0 ? { excluded_operations: excludedOperations } : {}),
       operations: operations.map((operation) => {
         const paramMappings = Object.fromEntries(
           operation.params
