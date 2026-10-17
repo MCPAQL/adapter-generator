@@ -2,6 +2,7 @@ import { TENANCY_RUNTIME } from "./tenancy-runtime.js";
 import type {
   AdapterPackageConfig,
   AdapterSchemaDocument,
+  AdapterResultShaping,
   AdapterSchemaOperation,
   AdapterStdioTarget,
   AdapterTenancy,
@@ -16,6 +17,8 @@ import type {
 
 export type {
   AdapterPackageConfig,
+  AdapterResultHandle,
+  AdapterResultShaping,
   AdapterSchemaDocument,
   AdapterSchemaOperation,
   AdapterStdioTarget,
@@ -262,6 +265,50 @@ function resolveStdioTarget(
   };
 }
 
+const HANDLE_PLACEHOLDER = "${handle}";
+
+function containsPlaceholder(value: unknown): boolean {
+  if (value === HANDLE_PLACEHOLDER) return true;
+  if (Array.isArray(value)) return value.some(containsPlaceholder);
+  if (value && typeof value === "object") return Object.values(value).some(containsPlaceholder);
+  return false;
+}
+
+// Shaping only pays off if the model can get the full data back, so every handle rule must
+// name operations that exist and a READ continuation that takes the handle id.
+function validateResultShaping(shaping: AdapterResultShaping, schema: AdapterSchemaDocument): AdapterResultShaping {
+  if (shaping.max_result_chars !== undefined && (!Number.isSafeInteger(shaping.max_result_chars) || shaping.max_result_chars < 0)) {
+    throw new Error("result_shaping.max_result_chars must be a non-negative integer.");
+  }
+  if (shaping.drop_duplicate_text !== undefined && typeof shaping.drop_duplicate_text !== "boolean") {
+    throw new Error("result_shaping.drop_duplicate_text must be a boolean.");
+  }
+  const endpointOf = new Map<string, string>();
+  for (const [endpoint, operations] of Object.entries(schema.operations)) {
+    for (const operation of operations ?? []) endpointOf.set(operation.name, endpoint);
+  }
+  for (const [index, rule] of (shaping.handles ?? []).entries()) {
+    const label = `result_shaping.handles[${index}]`;
+    if (!Array.isArray(rule.operations) || rule.operations.length === 0) throw new Error(`${label}.operations must list at least one operation.`);
+    for (const name of rule.operations) {
+      if (!endpointOf.has(name)) throw new Error(`${label} names operation '${name}', which is not in the adapter.`);
+    }
+    if (typeof rule.id_path !== "string" || rule.id_path === "") throw new Error(`${label}.id_path must be a non-empty string.`);
+    if (!Array.isArray(rule.keep_paths) || rule.keep_paths.some((path) => typeof path !== "string" || path === "")) {
+      throw new Error(`${label}.keep_paths must be an array of non-empty strings.`);
+    }
+    if (!rule.keep_paths.includes(rule.id_path)) throw new Error(`${label}.keep_paths must include id_path '${rule.id_path}'.`);
+    const continuation = rule.continuation;
+    if (!continuation || endpointOf.get(continuation.operation) !== "read") {
+      throw new Error(`${label}.continuation.operation must be a READ operation in the adapter.`);
+    }
+    if (!containsPlaceholder(continuation.params)) {
+      throw new Error(`${label}.continuation.params must pass the handle as "${HANDLE_PLACEHOLDER}".`);
+    }
+  }
+  return shaping;
+}
+
 function endpointKey(endpoint: DiscoveryOperation["endpoint"]): keyof AdapterSchemaDocument["operations"] {
   return ENDPOINT_KEY_BY_CATEGORY[endpoint];
 }
@@ -389,6 +436,10 @@ export function buildSchemaFromDiscoveryBundle(options: {
     const list = schema.operations[key] ?? [];
     list.push(toSchemaOperation(operation));
     schema.operations[key] = list;
+  }
+
+  if (overrides?.result_shaping) {
+    schema.result_shaping = validateResultShaping(overrides.result_shaping, schema);
   }
 
   const builderWarnings: SchemaBuildOutput["warnings"] = isStdioTransport && bundle.source.auth.type === "bearer"
@@ -553,6 +604,23 @@ const CALL_CONTROL_SECTION = `Upstream calls follow the caller's cancellation an
 Every endpoint except EXECUTE also accepts a batch, \`{ operations: [{ operation, params }, ...] }\`, run in order (\`MCPAQL_MAX_BATCH_OPERATIONS\`, default 25). A batch stops before any dangerous or confirmation-gated operation, which must be called on its own; a batch's duration is the sum of its operations.
 `;
 
+function resultShapingSection(schema: AdapterSchemaDocument): string {
+  const shaping = schema.result_shaping;
+  if (!shaping) return "";
+  const lines = ["", "Result shaping is on:", ""];
+  if (shaping.drop_duplicate_text) {
+    lines.push("- Text content that duplicates structured content is dropped.");
+  }
+  const operations = (shaping.handles ?? []).flatMap((rule) => rule.operations).length;
+  if (operations > 0) {
+    lines.push(
+      `- Over ${shaping.max_result_chars ?? 0} characters (\`MCPAQL_RESULT_BUDGET_CHARS\` overrides; 0 disables), results of ${operations} operations become a summary plus a ready-to-call continuation that pages the retained result.`,
+    );
+  }
+  lines.push("- Every shaped result lists what it omitted in `_meta.shaped`. Pass `params._full_result: true` to get the unshaped result.");
+  return `${lines.join("\n")}\n`;
+}
+
 function buildRunningSection(schema: AdapterSchemaDocument): string {
   if (schema.target.transport === "native-applescript") {
     return `## Running
@@ -593,7 +661,7 @@ npm install
 npm run start
 \`\`\`
 
-${CALL_CONTROL_SECTION}`;
+${CALL_CONTROL_SECTION}${resultShapingSection(schema)}`;
   }
 
   const authLine =
@@ -625,7 +693,7 @@ npm install
 npm run start
 \`\`\`
 
-${CALL_CONTROL_SECTION}`;
+${CALL_CONTROL_SECTION}${resultShapingSection(schema)}`;
 }
 
 /**
@@ -1664,6 +1732,95 @@ function buildIntrospection(params: Record<string, unknown>) {
   };
 }
 
+type ResultHandleRule = {
+  operations: string[];
+  id_path: string;
+  keep_paths: string[];
+  continuation: { operation: string; params: Record<string, unknown> };
+};
+type ResultShaping = { max_result_chars?: number; drop_duplicate_text?: boolean; handles?: ResultHandleRule[] };
+type ProxiedResult = { source_tool: string; content: unknown; structured_content: unknown; is_error: boolean };
+
+const RESULT_SHAPING = (schema as unknown as { result_shaping?: ResultShaping }).result_shaping;
+const RESULT_BUDGET_CHARS = process.env.MCPAQL_RESULT_BUDGET_CHARS?.trim() === "0"
+  ? 0
+  : positiveIntegerEnv("MCPAQL_RESULT_BUDGET_CHARS") ?? RESULT_SHAPING?.max_result_chars ?? 0;
+
+function valueAtPath(value: unknown, path: string): unknown {
+  let current = value;
+  for (const segment of path.split(".")) {
+    if (!current || typeof current !== "object" || Array.isArray(current) || !Object.hasOwn(current, segment)) return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+function pickPaths(value: unknown, paths: string[]): Record<string, unknown> {
+  const picked: Record<string, unknown> = {};
+  for (const path of paths) {
+    const found = valueAtPath(value, path);
+    if (found === undefined) continue;
+    const segments = path.split(".");
+    let target = picked;
+    for (const segment of segments.slice(0, -1)) {
+      target = (target[segment] ??= {}) as Record<string, unknown>;
+    }
+    target[segments[segments.length - 1]] = found;
+  }
+  return picked;
+}
+
+function withHandle(value: unknown, handle: string): unknown {
+  if (value === "\${handle}") return handle;
+  if (Array.isArray(value)) return value.map((entry) => withHandle(entry, handle));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, withHandle(entry, handle)]));
+  }
+  return value;
+}
+
+// Opt-in shaping of a successful result. Nothing is dropped silently: _meta.shaped lists what
+// was omitted, and params._full_result: true returns the unshaped result.
+function shapeResult(operationName: string, data: ProxiedResult, fullResult: boolean): { data: unknown; meta?: Record<string, unknown> } {
+  if (!RESULT_SHAPING || fullResult) return { data };
+  const omitted: string[] = [];
+  let shaped: Record<string, unknown> = { ...data };
+  if (RESULT_SHAPING.drop_duplicate_text && data.structured_content !== null && Array.isArray(data.content)) {
+    const kept = (data.content as Array<{ type?: string }>).filter((block) => block.type !== "text");
+    if (kept.length !== data.content.length) {
+      shaped.content = kept;
+      omitted.push("content text blocks (duplicate of structured_content)");
+    }
+  }
+  if (RESULT_BUDGET_CHARS > 0 && JSON.stringify(shaped).length > RESULT_BUDGET_CHARS) {
+    const rule = RESULT_SHAPING.handles?.find((candidate) => candidate.operations.includes(operationName));
+    const handle = rule ? valueAtPath(data.structured_content, rule.id_path) : undefined;
+    if (rule && typeof handle === "string" && handle !== "") {
+      shaped = {
+        source_tool: data.source_tool,
+        content: [],
+        structured_content: pickPaths(data.structured_content, rule.keep_paths),
+        is_error: data.is_error,
+        handle,
+        continuation: withHandle(rule.continuation, handle),
+      };
+      omitted.push("content", \`structured_content except \${rule.keep_paths.join(", ")}\`);
+    }
+  }
+  if (omitted.length === 0) return { data };
+  return {
+    data: shaped,
+    meta: {
+      shaped: {
+        original_chars: JSON.stringify(data).length,
+        returned_chars: JSON.stringify(shaped).length,
+        omitted,
+        full_result: "Repeat the call with params._full_result: true for the unshaped result.",
+      },
+    },
+  };
+}
+
 type UpstreamCallContext = {
   signal?: AbortSignal;
   progressToken?: string | number;
@@ -1748,6 +1905,12 @@ ${tenancy ? `  let tenant: TenantRef | undefined;
     };
   }`}
   const sourceTool = item.definition.maps_to.replace(/^tool:/, "");
+  // _full_result is the adapter's own flag; it never reaches the upstream.
+  const fullResult = params._full_result === true;
+  if ("_full_result" in params) {
+    params = { ...params };
+    delete params._full_result;
+  }
   const upstreamParams = mapParamsToUpstream(operationName, params);
   // One signal for both cancellation sources: the downstream request and the max-total cap.
   // Aborting it makes the SDK send notifications/cancelled to the upstream immediately.
@@ -1804,15 +1967,16 @@ ${tenancy ? "      _meta: tenantMeta,\n" : ""}    };
 ${tenancy ? "      _meta: tenantMeta,\n" : ""}    };
   }
 
+  const shaped = shapeResult(operationName, {
+    source_tool: sourceTool,
+    content: result.content,
+    structured_content: result.structuredContent ?? null,
+    is_error: Boolean(result.isError),
+  }, fullResult);
   return {
     success: true,
-    data: {
-      source_tool: sourceTool,
-      content: result.content,
-      structured_content: result.structuredContent ?? null,
-      is_error: Boolean(result.isError),
-    },
-${tenancy ? "    _meta: tenantMeta,\n" : ""}  };
+    data: shaped.data,
+${tenancy ? "    _meta: { ...tenantMeta, ...shaped.meta },\n" : "    ...(shaped.meta ? { _meta: shaped.meta } : {}),\n"}  };
 }
 
 const server = new Server(
