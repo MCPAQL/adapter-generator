@@ -25,6 +25,36 @@ server.registerTool("env_keys", {}, async () => ({
   },
 }));
 
+let aborted = 0;
+
+// Sleeps ms, optionally sending a progress notification every progress_every_ms.
+server.registerTool(
+  "slow",
+  { inputSchema: { ms: z.number(), progress_every_ms: z.number().optional() } },
+  async ({ ms, progress_every_ms }, extra) => {
+    const token = extra._meta?.progressToken;
+    const started = Date.now();
+    let step = 0;
+    while (Date.now() - started < ms) {
+      if (extra.signal.aborted) {
+        aborted += 1;
+        throw new Error("aborted");
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(progress_every_ms ?? 25, 25)));
+      if (progress_every_ms && token !== undefined && Date.now() - started >= (step + 1) * progress_every_ms) {
+        step += 1;
+        await extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: step, message: `step ${step}` } });
+      }
+    }
+    return { content: [{ type: "text", text: "done" }], structuredContent: { steps: step } };
+  },
+);
+
+server.registerTool("aborted_count", {}, async () => ({
+  content: [{ type: "text", text: String(aborted) }],
+  structuredContent: { aborted },
+}));
+
 server.registerTool("crash", {}, async () => {
   setImmediate(() => process.exit(3));
   return new Promise(() => {});
