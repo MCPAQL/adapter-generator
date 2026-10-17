@@ -181,6 +181,8 @@ test("stdio README documents the launch command and child environment", () => {
   assert.ok(readme.includes(`${process.execPath} ${fixturePath}`));
   assert.match(readme, /`FIXTURE_SOURCE` \(required\): passed to the upstream as `FIXTURE_SECRET`/);
   assert.match(readme, /`FIXTURE_PASS` \(optional\)/);
+  assert.match(readme, /MCPAQL_UPSTREAM_TIMEOUT_MS/);
+  assert.match(readme, /MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS/);
 });
 
 async function writeGeneratedAdapter(bundle: DiscoveryBundle = stdioBundle): Promise<string> {
@@ -453,23 +455,46 @@ test("the upstream deadline returns UPSTREAM_TIMEOUT and is extended by progress
   assert.equal(silent.success, false);
   assert.equal(silent.error.code, "UPSTREAM_TIMEOUT");
   assert.equal(silent.error.details.timeout_ms, 300);
+  assert.equal(silent.error.details.limit, "per_call");
   // Progress every 100 ms keeps resetting the 300 ms deadline, even though this caller did not ask for progress.
   const reporting = parse(await client.callTool(slow(1200, 100)));
   assert.equal(reporting.success, true);
 });
 
-test("MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS caps calls that keep reporting progress", async (t) => {
+test("MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS caps calls with or without progress and cancels the upstream", async (t) => {
   const client = await connectAdapter(t, { MCPAQL_UPSTREAM_TIMEOUT_MS: "300", MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS: "600" });
-  const result = parse(await client.callTool(slow(2000, 100)));
-  assert.equal(result.success, false);
-  assert.equal(result.error.code, "UPSTREAM_TIMEOUT");
+  const started = Date.now();
+  const reporting = parse(await client.callTool(slow(3000, 100)));
+  assert.equal(reporting.success, false);
+  assert.equal(reporting.error.code, "UPSTREAM_TIMEOUT");
+  assert.equal(reporting.error.details.limit, "max_total");
+  assert.equal(reporting.error.details.timeout_ms, 600);
+  assert.ok(Date.now() - started < 1500, "cap fired late");
+
+  // A silent upstream is capped too, even with a per-call deadline longer than the cap.
+  const silentClient = await connectAdapter(t, { MCPAQL_UPSTREAM_TIMEOUT_MS: "60000", MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS: "500" });
+  const silentStart = Date.now();
+  const silent = parse(await silentClient.callTool(slow(3000)));
+  assert.equal(silent.error.details.limit, "max_total");
+  assert.ok(Date.now() - silentStart < 1500, "cap did not apply to a silent upstream");
+
+  // The cap cancels the upstream call instead of leaving it running.
+  let aborted = 0;
+  const deadline = Date.now() + 3000;
+  while (aborted === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    aborted = parse(await silentClient.callTool({ name: "mcp_aql_read", arguments: { operation: "aborted_count" } })).data.structured_content.aborted;
+  }
+  assert.equal(aborted, 1);
 });
 
 test("cancelling the downstream request cancels the upstream call", async (t) => {
   const client = await connectAdapter(t);
+  // Start the upstream first, so the abort cannot land while the child is still being spawned.
+  await client.callTool({ name: "mcp_aql_read", arguments: { operation: "aborted_count" } });
   const controller = new AbortController();
-  const pending = client.callTool(slow(5000), undefined, { signal: controller.signal });
-  setTimeout(() => controller.abort(), 300);
+  // Abort on the first forwarded progress event: by then the upstream is running this call.
+  const pending = client.callTool(slow(5000, 50), undefined, { signal: controller.signal, onprogress: () => controller.abort() });
   await assert.rejects(pending);
   // Give the cancellation notification time to reach the upstream.
   let aborted = 0;
@@ -481,19 +506,26 @@ test("cancelling the downstream request cancels the upstream call", async (t) =>
   assert.equal(aborted, 1);
 });
 
-test("an invalid timeout setting is reported, not ignored", async (t) => {
+test("invalid timeout settings are reported, not ignored", { timeout: 30_000 }, async (t) => {
   const dir = await writeGeneratedAdapter();
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-    const child = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
-      cwd: dir,
-      env: { ...getDefaultEnvironment(), MCPAQL_UPSTREAM_TIMEOUT_MS: "soon" },
-      stdio: ["pipe", "ignore", "pipe"],
+  // "3000000000" exceeds Node's timer range and would otherwise fire after 1 ms.
+  for (const value of ["soon", "1e3", "0x3e8", "0", "3000000000"]) {
+    const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+      const child = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
+        cwd: dir,
+        env: { ...getDefaultEnvironment(), MCPAQL_UPSTREAM_TIMEOUT_MS: value },
+        stdio: ["pipe", "ignore", "pipe"],
+      });
+      const killer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+      let stderr = "";
+      child.stderr!.on("data", (chunk) => { stderr += chunk; });
+      child.on("exit", (code) => {
+        clearTimeout(killer);
+        resolve({ code, stderr });
+      });
     });
-    let stderr = "";
-    child.stderr!.on("data", (chunk) => { stderr += chunk; });
-    child.on("exit", (code) => resolve({ code, stderr }));
-  });
-  assert.notEqual(result.code, 0);
-  assert.match(result.stderr, /MCPAQL_UPSTREAM_TIMEOUT_MS must be a positive integer/);
+    assert.notEqual(result.code, 0, value);
+    assert.match(result.stderr, /MCPAQL_UPSTREAM_TIMEOUT_MS must be a positive integer number of milliseconds, at most 2147483647/, value);
+  }
 });

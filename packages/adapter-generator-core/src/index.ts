@@ -499,6 +499,12 @@ function buildEndpointDescriptions(schema: AdapterSchemaDocument): string {
     .join("\n");
 }
 
+const CALL_CONTROL_SECTION = `Upstream calls follow the caller's cancellation and forward upstream progress. Optional limits:
+
+- \`MCPAQL_UPSTREAM_TIMEOUT_MS\` (default 60000): per-call deadline, reset by each upstream progress notification.
+- \`MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS\`: hard cap per call, regardless of progress; the upstream call is cancelled when it is reached.
+`;
+
 function buildRunningSection(schema: AdapterSchemaDocument): string {
   if (schema.target.transport === "native-applescript") {
     return `## Running
@@ -538,7 +544,8 @@ ${varLines.length > 0 ? `\n${varLines.join("\n")}\n` : ""}
 npm install
 npm run start
 \`\`\`
-`;
+
+${CALL_CONTROL_SECTION}`;
   }
 
   const authLine =
@@ -569,7 +576,8 @@ ${envSection}
 npm install
 npm run start
 \`\`\`
-`;
+
+${CALL_CONTROL_SECTION}`;
 }
 
 /**
@@ -1607,28 +1615,44 @@ type UpstreamCallContext = {
   sendProgress?: (progress: { progress: number; total?: number; message?: string }) => Promise<void>;
 };
 
+// Node timers hold at most 2^31 - 1 ms; larger delays silently fire after 1 ms.
+const MAX_TIMER_MS = 2_147_483_647;
+
 function positiveIntegerEnv(name: string): number | undefined {
   const raw = process.env[name]?.trim();
   if (!raw) return undefined;
-  const value = Number(raw);
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(\`\${name} must be a positive integer number of milliseconds.\`);
+  const value = /^\\d+$/.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_TIMER_MS) {
+    throw new Error(\`\${name} must be a positive integer number of milliseconds, at most \${MAX_TIMER_MS}.\`);
   }
   return value;
 }
 
 // Per-call upstream deadline. Upstream progress notifications reset it, so long analyses that
-// report progress keep running; MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS caps them regardless.
+// report progress keep running. MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS caps a call regardless of
+// progress; the adapter enforces it with its own timer so the upstream is cancelled on time.
 const UPSTREAM_TIMEOUT_MS = positiveIntegerEnv("MCPAQL_UPSTREAM_TIMEOUT_MS") ?? 60_000;
 const UPSTREAM_MAX_TOTAL_TIMEOUT_MS = positiveIntegerEnv("MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS");
 
-function upstreamCallError(error: unknown, call: UpstreamCallContext | undefined, sourceTool: string) {
+function upstreamCallError(error: unknown, call: UpstreamCallContext | undefined, sourceTool: string, capReached: boolean) {
   const message = error instanceof Error ? error.message : String(error);
+  // The SDK reports aborts as RequestTimeout too, so check who aborted first. A cancelled
+  // downstream request gets no response; this result is for logs and tests.
   if (call?.signal?.aborted) {
     return { success: false, error: { code: "CANCELLED", message: \`Call to upstream tool '\${sourceTool}' was cancelled.\` } };
   }
+  if (capReached) {
+    return {
+      success: false,
+      error: {
+        code: "UPSTREAM_TIMEOUT",
+        message: \`Upstream tool '\${sourceTool}' exceeded the maximum total time.\`,
+        details: { source_tool: sourceTool, limit: "max_total", timeout_ms: UPSTREAM_MAX_TOTAL_TIMEOUT_MS },
+      },
+    };
+  }
   if (error instanceof McpError && error.code === ErrorCode.RequestTimeout) {
-    return { success: false, error: { code: "UPSTREAM_TIMEOUT", message, details: { source_tool: sourceTool, timeout_ms: UPSTREAM_TIMEOUT_MS } } };
+    return { success: false, error: { code: "UPSTREAM_TIMEOUT", message, details: { source_tool: sourceTool, limit: "per_call", timeout_ms: UPSTREAM_TIMEOUT_MS } } };
   }
   return { success: false, error: { code: "UPSTREAM_CALL_FAILED", message, details: { source_tool: sourceTool } } };
 }
@@ -1670,17 +1694,28 @@ ${tenancy ? `  let tenant: TenantRef | undefined;
   }`}
   const sourceTool = item.definition.maps_to.replace(/^tool:/, "");
   const upstreamParams = mapParamsToUpstream(operationName, params);
+  // One signal for both cancellation sources: the downstream request and the max-total cap.
+  // Aborting it makes the SDK send notifications/cancelled to the upstream immediately.
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(call?.signal?.reason);
+  if (call?.signal?.aborted) controller.abort(call.signal.reason);
+  call?.signal?.addEventListener("abort", forwardAbort, { once: true });
+  let capReached = false;
+  const capTimer = UPSTREAM_MAX_TOTAL_TIMEOUT_MS
+    ? setTimeout(() => {
+        capReached = true;
+        controller.abort(new Error("Maximum total time exceeded."));
+      }, UPSTREAM_MAX_TOTAL_TIMEOUT_MS)
+    : undefined;
   let result: Awaited<ReturnType<Client["callTool"]>>;
   try {
     result = await upstream.callTool(
       { name: sourceTool, arguments: upstreamParams },
       undefined,
       {
-        // Cancelling the downstream request cancels the upstream call (notifications/cancelled).
-        signal: call?.signal,
+        signal: controller.signal,
         timeout: UPSTREAM_TIMEOUT_MS,
         resetTimeoutOnProgress: true,
-        ...(UPSTREAM_MAX_TOTAL_TIMEOUT_MS ? { maxTotalTimeout: UPSTREAM_MAX_TOTAL_TIMEOUT_MS } : {}),
         // Always ask the upstream for progress so it can extend the deadline; forward it only
         // when the caller asked for progress on this request.
         onprogress: (progress) => {
@@ -1692,8 +1727,11 @@ ${tenancy ? `  let tenant: TenantRef | undefined;
     );
   } catch (error) {
     return {
-      ...upstreamCallError(error, call, sourceTool),
+      ...upstreamCallError(error, call, sourceTool, capReached),
 ${tenancy ? "      _meta: tenantMeta,\n" : ""}    };
+  } finally {
+    clearTimeout(capTimer);
+    call?.signal?.removeEventListener("abort", forwardAbort);
   }
 
   if (result.isError) {
