@@ -78,6 +78,23 @@ test("schema builder emits a stdio target without auth or headers", () => {
   assert.equal(schema.headers, undefined);
 });
 
+test("schema builder reads launch fields from an interrogation-style transport object", () => {
+  const bundle: DiscoveryBundle = {
+    ...stdioBundle,
+    source: {
+      ...stdioBundle.source,
+      server_url: "stdio://example",
+      capture_config_redacted: {
+        name: "example",
+        transport: { type: "stdio", command: "npx", args: ["-y", "example-mcp@1.2.3", "mcp"] },
+      },
+    },
+  };
+  const { schema } = buildSchemaFromDiscoveryBundle({ bundle });
+  assert.equal(schema.target.transport, "stdio");
+  assert.deepEqual(schema.target.stdio, { command: "npx", args: ["-y", "example-mcp@1.2.3", "mcp"] });
+});
+
 test("overrides.stdio pins launch fields over the capture", () => {
   const { schema } = buildSchemaFromDiscoveryBundle({
     bundle: stdioBundle,

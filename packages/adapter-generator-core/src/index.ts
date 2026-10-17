@@ -241,8 +241,12 @@ export function buildSchemaFromDiscoveryBundle(options: {
   const captureConfig = bundle.source.capture_config_redacted;
   const isNativeTransport = captureConfig?.transport === "native-applescript"
     || bundle.source.server_url.startsWith("native-applescript://");
+  // Interrogation configs record transport as { type, ...launch fields }; hand-written captures may use a bare string.
+  const transportConfig = captureConfig?.transport && typeof captureConfig.transport === "object" && !Array.isArray(captureConfig.transport)
+    ? captureConfig.transport as Record<string, unknown>
+    : undefined;
   const isStdioTransport = !isNativeTransport
-    && (captureConfig?.transport === "stdio" || bundle.source.server_url.startsWith("stdio://"));
+    && (captureConfig?.transport === "stdio" || transportConfig?.type === "stdio" || bundle.source.server_url.startsWith("stdio://"));
   const transport: AdapterSchemaDocument["target"]["transport"] = isNativeTransport
     ? "native-applescript"
     : isStdioTransport ? "stdio" : "http";
@@ -252,7 +256,7 @@ export function buildSchemaFromDiscoveryBundle(options: {
   const application = isNativeTransport
     ? (captureConfig?.application as string | undefined) ?? bundle.source.server?.name
     : undefined;
-  const stdio = isStdioTransport ? resolveStdioTarget(captureConfig, overrides?.stdio) : undefined;
+  const stdio = isStdioTransport ? resolveStdioTarget(transportConfig ?? captureConfig, overrides?.stdio) : undefined;
 
   // Request headers exist only on HTTP upstreams.
   const capturedHeaders = isStdioTransport ? undefined : captureConfig?.headers;
