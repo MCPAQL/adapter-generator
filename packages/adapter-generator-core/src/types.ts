@@ -140,14 +140,14 @@ export interface AdapterResultShaping {
    * MCPAQL_RESULT_BUDGET_CHARS overrides it.
    */
   max_result_chars?: number;
-  /** Drop text content blocks when the upstream also returned structuredContent (the same data twice). */
+  /** Drop text content blocks that are JSON for exactly the structuredContent (the same data twice). */
   drop_duplicate_text?: boolean;
   handles?: AdapterResultHandle[];
 }
 
 /** How to replace an oversized result with a retained-result handle the model can page. */
 export interface AdapterResultHandle {
-  /** Operations whose results the upstream retains and can serve again through `continuation`. */
+  /** READ operations whose results the upstream retains and can serve again through `continuation`. */
   operations: string[];
   /** Dotted path of the handle id inside structuredContent, e.g. "evidence_id". */
   id_path: string;

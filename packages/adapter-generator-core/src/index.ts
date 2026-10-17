@@ -266,6 +266,7 @@ function resolveStdioTarget(
 }
 
 const HANDLE_PLACEHOLDER = "${handle}";
+const UNSAFE_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
 
 function containsPlaceholder(value: unknown): boolean {
   if (value === HANDLE_PLACEHOLDER) return true;
@@ -283,19 +284,39 @@ function validateResultShaping(shaping: AdapterResultShaping, schema: AdapterSch
   if (shaping.drop_duplicate_text !== undefined && typeof shaping.drop_duplicate_text !== "boolean") {
     throw new Error("result_shaping.drop_duplicate_text must be a boolean.");
   }
+  if (shaping.handles !== undefined && !Array.isArray(shaping.handles)) {
+    throw new Error("result_shaping.handles must be an array.");
+  }
+  if ((shaping.handles ?? []).length > 0 && !(shaping.max_result_chars && shaping.max_result_chars > 0)) {
+    throw new Error("result_shaping.max_result_chars must be positive when handles are configured.");
+  }
+  if (schema.tenancy?.noun === "shaped") {
+    throw new Error("A tenancy noun of 'shaped' collides with result shaping's _meta.shaped.");
+  }
   const endpointOf = new Map<string, string>();
   for (const [endpoint, operations] of Object.entries(schema.operations)) {
-    for (const operation of operations ?? []) endpointOf.set(operation.name, endpoint);
+    for (const operation of operations ?? []) {
+      endpointOf.set(operation.name, endpoint);
+      // With shaping on, _full_result is the adapter's own flag and never reaches the upstream.
+      if (operation.params && Object.hasOwn(operation.params, "_full_result")) {
+        throw new Error(`Operation '${operation.name}' declares a '_full_result' parameter, which result shaping reserves.`);
+      }
+    }
   }
+  const unsafePath = (path: string) => path.split(".").some((segment) => segment === "" || UNSAFE_PATH_SEGMENTS.has(segment));
   for (const [index, rule] of (shaping.handles ?? []).entries()) {
     const label = `result_shaping.handles[${index}]`;
     if (!Array.isArray(rule.operations) || rule.operations.length === 0) throw new Error(`${label}.operations must list at least one operation.`);
     for (const name of rule.operations) {
       if (!endpointOf.has(name)) throw new Error(`${label} names operation '${name}', which is not in the adapter.`);
+      // Re-running with _full_result must be safe, so only READ results get handles.
+      if (endpointOf.get(name) !== "read") throw new Error(`${label} names '${name}', which is not a READ operation.`);
     }
-    if (typeof rule.id_path !== "string" || rule.id_path === "") throw new Error(`${label}.id_path must be a non-empty string.`);
-    if (!Array.isArray(rule.keep_paths) || rule.keep_paths.some((path) => typeof path !== "string" || path === "")) {
-      throw new Error(`${label}.keep_paths must be an array of non-empty strings.`);
+    if (typeof rule.id_path !== "string" || rule.id_path === "" || unsafePath(rule.id_path)) {
+      throw new Error(`${label}.id_path must be a dotted path without empty, __proto__, constructor or prototype segments.`);
+    }
+    if (!Array.isArray(rule.keep_paths) || rule.keep_paths.some((path) => typeof path !== "string" || path === "" || unsafePath(path))) {
+      throw new Error(`${label}.keep_paths must be dotted paths without empty, __proto__, constructor or prototype segments.`);
     }
     if (!rule.keep_paths.includes(rule.id_path)) throw new Error(`${label}.keep_paths must include id_path '${rule.id_path}'.`);
     const continuation = rule.continuation;
@@ -609,12 +630,12 @@ function resultShapingSection(schema: AdapterSchemaDocument): string {
   if (!shaping) return "";
   const lines = ["", "Result shaping is on:", ""];
   if (shaping.drop_duplicate_text) {
-    lines.push("- Text content that duplicates structured content is dropped.");
+    lines.push("- Text content that is JSON for exactly the structured content is dropped.");
   }
-  const operations = (shaping.handles ?? []).flatMap((rule) => rule.operations).length;
+  const operations = new Set((shaping.handles ?? []).flatMap((rule) => rule.operations)).size;
   if (operations > 0) {
     lines.push(
-      `- Over ${shaping.max_result_chars ?? 0} characters (\`MCPAQL_RESULT_BUDGET_CHARS\` overrides; 0 disables), results of ${operations} operations become a summary plus a ready-to-call continuation that pages the retained result.`,
+      `- Over ${shaping.max_result_chars} characters per operation (\`MCPAQL_RESULT_BUDGET_CHARS\` overrides; 0 disables), results of ${operations} READ operation${operations === 1 ? "" : "s"} become a summary plus a ready-to-call continuation that pages the retained result.`,
     );
   }
   lines.push("- Every shaped result lists what it omitted in `_meta.shaped`. Pass `params._full_result: true` to get the unshaped result.");
@@ -1742,9 +1763,18 @@ type ResultShaping = { max_result_chars?: number; drop_duplicate_text?: boolean;
 type ProxiedResult = { source_tool: string; content: unknown; structured_content: unknown; is_error: boolean };
 
 const RESULT_SHAPING = (schema as unknown as { result_shaping?: ResultShaping }).result_shaping;
-const RESULT_BUDGET_CHARS = process.env.MCPAQL_RESULT_BUDGET_CHARS?.trim() === "0"
-  ? 0
-  : positiveIntegerEnv("MCPAQL_RESULT_BUDGET_CHARS") ?? RESULT_SHAPING?.max_result_chars ?? 0;
+
+// Read only when shaping is configured; its own parser, independent of the timer settings.
+function resultBudgetChars(): number {
+  if (!RESULT_SHAPING) return 0;
+  const raw = process.env.MCPAQL_RESULT_BUDGET_CHARS?.trim();
+  if (!raw) return RESULT_SHAPING.max_result_chars ?? 0;
+  if (!/^\\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+    throw new Error("MCPAQL_RESULT_BUDGET_CHARS must be a non-negative integer number of characters (0 disables).");
+  }
+  return Number(raw);
+}
+const RESULT_BUDGET_CHARS = resultBudgetChars();
 
 function valueAtPath(value: unknown, path: string): unknown {
   let current = value;
@@ -1755,15 +1785,17 @@ function valueAtPath(value: unknown, path: string): unknown {
   return current;
 }
 
+// Null-prototype containers: a kept path can never reach Object.prototype.
 function pickPaths(value: unknown, paths: string[]): Record<string, unknown> {
-  const picked: Record<string, unknown> = {};
+  const picked: Record<string, unknown> = Object.create(null);
   for (const path of paths) {
     const found = valueAtPath(value, path);
     if (found === undefined) continue;
     const segments = path.split(".");
     let target = picked;
     for (const segment of segments.slice(0, -1)) {
-      target = (target[segment] ??= {}) as Record<string, unknown>;
+      if (!Object.hasOwn(target, segment)) target[segment] = Object.create(null);
+      target = target[segment] as Record<string, unknown>;
     }
     target[segments[segments.length - 1]] = found;
   }
@@ -1779,6 +1811,24 @@ function withHandle(value: unknown, handle: string): unknown {
   return value;
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return \`[\${value.map(canonicalJson).join(",")}]\`;
+  if (value && typeof value === "object") {
+    return \`{\${Object.keys(value).sort().map((key) => \`\${JSON.stringify(key)}:\${canonicalJson((value as Record<string, unknown>)[key])}\`).join(",")}}\`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+// A text block counts as a duplicate only if it is JSON for exactly the structured content.
+function isDuplicateText(block: { type?: string; text?: unknown }, structured: unknown): boolean {
+  if (block.type !== "text" || typeof block.text !== "string") return false;
+  try {
+    return canonicalJson(JSON.parse(block.text)) === canonicalJson(structured);
+  } catch {
+    return false;
+  }
+}
+
 // Opt-in shaping of a successful result. Nothing is dropped silently: _meta.shaped lists what
 // was omitted, and params._full_result: true returns the unshaped result.
 function shapeResult(operationName: string, data: ProxiedResult, fullResult: boolean): { data: unknown; meta?: Record<string, unknown> } {
@@ -1786,28 +1836,38 @@ function shapeResult(operationName: string, data: ProxiedResult, fullResult: boo
   const omitted: string[] = [];
   let shaped: Record<string, unknown> = { ...data };
   if (RESULT_SHAPING.drop_duplicate_text && data.structured_content !== null && Array.isArray(data.content)) {
-    const kept = (data.content as Array<{ type?: string }>).filter((block) => block.type !== "text");
+    const kept = (data.content as Array<{ type?: string; text?: unknown }>).filter((block) => !isDuplicateText(block, data.structured_content));
     if (kept.length !== data.content.length) {
       shaped.content = kept;
-      omitted.push("content text blocks (duplicate of structured_content)");
+      omitted.push("content text blocks that repeat structured_content exactly");
     }
   }
-  if (RESULT_BUDGET_CHARS > 0 && JSON.stringify(shaped).length > RESULT_BUDGET_CHARS) {
-    const rule = RESULT_SHAPING.handles?.find((candidate) => candidate.operations.includes(operationName));
-    const handle = rule ? valueAtPath(data.structured_content, rule.id_path) : undefined;
-    if (rule && typeof handle === "string" && handle !== "") {
-      shaped = {
-        source_tool: data.source_tool,
-        content: [],
-        structured_content: pickPaths(data.structured_content, rule.keep_paths),
-        is_error: data.is_error,
-        handle,
-        continuation: withHandle(rule.continuation, handle),
-      };
-      omitted.push("content", \`structured_content except \${rule.keep_paths.join(", ")}\`);
+  const rule = RESULT_BUDGET_CHARS > 0 ? RESULT_SHAPING.handles?.find((candidate) => candidate.operations.includes(operationName)) : undefined;
+  let budgetExceeded: Record<string, unknown> | undefined;
+  if (rule) {
+    const shapedChars = JSON.stringify(shaped).length;
+    if (shapedChars > RESULT_BUDGET_CHARS) {
+      const id = valueAtPath(data.structured_content, rule.id_path);
+      const handle = typeof id === "string" || typeof id === "number" ? String(id) : "";
+      if (handle !== "") {
+        shaped = {
+          source_tool: data.source_tool,
+          content: [],
+          structured_content: pickPaths(data.structured_content, rule.keep_paths),
+          is_error: data.is_error,
+          handle,
+          continuation: { tool: TOOL_NAME_BY_ENDPOINT.READ, ...(withHandle(rule.continuation, handle) as object) },
+        };
+        omitted.push("content", \`structured_content except \${rule.keep_paths.join(", ")}\`);
+      } else {
+        // Over budget, but no usable handle: return everything and say why it was not shaped.
+        budgetExceeded = { chars: shapedChars, budget: RESULT_BUDGET_CHARS, reason: \`no handle at \${rule.id_path}; full result returned\` };
+      }
     }
   }
-  if (omitted.length === 0) return { data };
+  if (omitted.length === 0) {
+    return budgetExceeded ? { data, meta: { shaped: { omitted: [], budget_exceeded: budgetExceeded } } } : { data };
+  }
   return {
     data: shaped,
     meta: {
@@ -1815,6 +1875,7 @@ function shapeResult(operationName: string, data: ProxiedResult, fullResult: boo
         original_chars: JSON.stringify(data).length,
         returned_chars: JSON.stringify(shaped).length,
         omitted,
+        ...(budgetExceeded ? { budget_exceeded: budgetExceeded } : {}),
         full_result: "Repeat the call with params._full_result: true for the unshaped result.",
       },
     },
@@ -1905,9 +1966,10 @@ ${tenancy ? `  let tenant: TenantRef | undefined;
     };
   }`}
   const sourceTool = item.definition.maps_to.replace(/^tool:/, "");
-  // _full_result is the adapter's own flag; it never reaches the upstream.
-  const fullResult = params._full_result === true;
-  if ("_full_result" in params) {
+  // With result shaping on, _full_result is the adapter's own flag and never reaches the
+  // upstream; without shaping it is an ordinary parameter.
+  const fullResult = RESULT_SHAPING !== undefined && params._full_result === true;
+  if (RESULT_SHAPING && "_full_result" in params) {
     params = { ...params };
     delete params._full_result;
   }
