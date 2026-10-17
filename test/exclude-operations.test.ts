@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildSchemaFromDiscoveryBundle,
   generateAdapterPackage,
+  type AdapterSchemaDocument,
   type DiscoveryBundle,
   type DiscoveryOperation,
 } from "@mcpaql/adapter-generator-core";
@@ -80,5 +81,65 @@ test("invalid exclude_endpoints entries are refused", () => {
   assert.throws(
     () => buildSchemaFromDiscoveryBundle({ bundle, overrides: { exclude_endpoints: ["RUN" as never] } }),
     /Invalid exclude_endpoints entry 'RUN'/,
+  );
+});
+
+test("exclusion fails closed when an exclude key names no operation", () => {
+  assert.throws(
+    () => buildSchemaFromDiscoveryBundle({ bundle, overrides: { operations: { run_targett: { exclude: true } } } }),
+    /Override 'run_targett' sets exclude, but no operation in the bundle has that name/,
+  );
+});
+
+test("an operation is excluded under its renamed name or when any matching override excludes it", () => {
+  const renamed = buildSchemaFromDiscoveryBundle({
+    bundle,
+    overrides: { operations: { run_target: { operation_name: "launch" }, launch: { exclude: true } } },
+  });
+  assert.equal(renamed.schema.operations.execute, undefined);
+  assert.equal(renamed.metadata.excluded_operations?.[0].operation_name, "launch");
+
+  // Source tool name and operation name differ; one override reclassifies, the other excludes.
+  const split: DiscoveryBundle = {
+    ...bundle,
+    normalized_bundle: {
+      ...bundle.normalized_bundle,
+      operations: [{ ...operation("start_trace", "READ"), source_tool_name: "startTrace", maps_to: "tool:startTrace" }],
+    },
+  };
+  const output = buildSchemaFromDiscoveryBundle({
+    bundle: split,
+    overrides: { operations: { startTrace: { endpoint: "EXECUTE" }, start_trace: { exclude: true, exclude_reason: "runtime" } } },
+  });
+  assert.equal(output.schema.operations.execute, undefined);
+  assert.equal(output.metadata.excluded_operations?.[0].reason, "runtime");
+});
+
+test("exclude overrides are type-checked", () => {
+  const build = (overrides: unknown) => () => buildSchemaFromDiscoveryBundle({ bundle, overrides: overrides as never });
+  assert.throws(build({ exclude_endpoints: "EXECUTE" }), /exclude_endpoints must be an array/);
+  assert.throws(build({ operations: { close: { exclude: "false" } } }), /must be a boolean/);
+  assert.throws(build({ operations: { close: { exclude_reason: "why" } } }), /exclude_reason without exclude: true/);
+});
+
+test("templates cannot re-add an excluded operation", () => {
+  const schema: AdapterSchemaDocument = {
+    name: "mail",
+    type: "adapter",
+    version: "0.1.0",
+    description: "Mail",
+    target: { base_url: "native-applescript://Mail", transport: "native-applescript", protocol: "custom", serialization: "json", application: "Mail" },
+    operations: { read: [{ name: "list_mailboxes", maps_to: "native-applescript:command:listMailboxes", description: "List" }] },
+  };
+  assert.throws(
+    () => generateAdapterPackage({
+      schema,
+      provenance: { excluded_operations: [{ operation_name: "send_message", source_tool_name: "send_message", endpoint: "EXECUTE", reason: "x" }] },
+      templates: {
+        schema_version: "1.0.0-draft",
+        templates: { send_message: { language: "JavaScript", script: "1", endpoint: "EXECUTE", description: "Send" } },
+      },
+    }),
+    /Templates cannot re-add excluded operations: send_message/,
   );
 });
