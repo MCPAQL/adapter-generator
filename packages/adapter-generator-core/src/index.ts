@@ -1931,20 +1931,28 @@ async function runBatch(toolName: string, entries: unknown[], call: UpstreamCall
   // spans [i, i+1), filled in by the upstream's own progress when it reports a total.
   const total = entries.length;
   let lastProgress = -1;
-  const report = (progress: number, message: string) => {
+  const report = async (progress: number, message: string) => {
     if (!call.sendProgress || progress <= lastProgress) return;
     lastProgress = progress;
-    void call.sendProgress({ progress, total, message }).catch(() => undefined);
+    await call.sendProgress({ progress, total, message }).catch(() => undefined);
   };
-  const callFor = (index: number, operation: string): UpstreamCallContext => ({
-    ...call,
-    sendProgress: call.sendProgress
-      ? async (progress) => {
-          const fraction = progress.total ? Math.min(progress.progress / progress.total, 0.99) : 0;
-          report(index + fraction, \`\${operation}\${progress.message ? \`: \${progress.message}\` : ""}\`);
-        }
-      : undefined,
-  });
+  const callFor = (index: number, operation: string): UpstreamCallContext => {
+    // Without a total, each upstream notification still moves progress forward (approaching
+    // index + 1), so hosts that extend deadlines on progress keep long operations alive.
+    let notifications = 0;
+    return {
+      ...call,
+      sendProgress: call.sendProgress
+        ? async (progress) => {
+            notifications += 1;
+            const fraction = progress.total
+              ? Math.min(progress.progress / progress.total, 0.99)
+              : 0.99 * (1 - 1 / (1 + notifications));
+            void report(index + fraction, \`\${operation}\${progress.message ? \`: \${progress.message}\` : ""}\`);
+          }
+        : undefined,
+    };
+  };
 
   const results: Array<{ index: number; operation: string; result: unknown }> = [];
   let succeeded = 0;
@@ -1984,12 +1992,13 @@ async function runBatch(toolName: string, entries: unknown[], call: UpstreamCall
         summary: { total, succeeded, failed: results.length - succeeded, halted: 1, pending: total - index - 1 },
       };
     }
-    report(index, operation);
+    void report(index, operation);
     const result = await runOperation(toolName, operation, params, callFor(index, operation)) as { success?: boolean };
     if (result.success) succeeded += 1;
     results.push({ index, operation, result });
   }
-  report(total, "batch complete");
+  // Awaited so the final progress event is sent before the response.
+  await report(total, "batch complete");
   return {
     success: true,
     data: null,

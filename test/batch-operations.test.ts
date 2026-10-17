@@ -228,3 +228,21 @@ test("switching the active tenant is a single-call operation", () => {
   const added = server.indexOf('maps_to: "adapter:" + SET_ACTIVE_TENANT');
   assert.ok(added > 0 && added < server.indexOf("const TOOL_BY_OPERATION"));
 });
+
+test("upstream progress without a total keeps a long batch operation alive", async (t) => {
+  const { client } = await connect(t);
+  const events: number[] = [];
+  // The fixture reports progress with no total every 50 ms; a 400 ms deadline that resets on
+  // progress only survives a 1 s operation if the batch forwards those events.
+  const result = await client.callTool(
+    { name: "mcp_aql_read", arguments: { operations: [{ operation: "slow", params: { ms: 1000, progress_every_ms: 50 } }] } },
+    undefined,
+    { timeout: 400, resetTimeoutOnProgress: true, onprogress: (progress) => events.push(progress.progress) },
+  );
+  const batch = JSON.parse((result.content as Array<{ text: string }>)[0].text);
+  assert.equal(batch.results[0].result.success, true);
+  assert.ok(events.length > 5, `expected forwarded progress, got ${events.length}`);
+  for (let index = 1; index < events.length; index += 1) assert.ok(events[index] > events[index - 1]);
+  assert.ok(events.slice(0, -1).every((value) => value < 1));
+  assert.equal(events[events.length - 1], 1);
+});
