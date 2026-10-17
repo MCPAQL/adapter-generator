@@ -549,6 +549,8 @@ const CALL_CONTROL_SECTION = `Upstream calls follow the caller's cancellation an
 
 - \`MCPAQL_UPSTREAM_TIMEOUT_MS\` (default 60000): per-call deadline, reset by each upstream progress notification.
 - \`MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS\`: hard cap per call, regardless of progress; the upstream call is cancelled when it is reached.
+
+Every endpoint except EXECUTE also accepts a batch, \`{ operations: [{ operation, params }, ...] }\`, run in order (\`MCPAQL_MAX_BATCH_OPERATIONS\`, default 25). A batch stops before any dangerous or confirmation-gated operation, which must be called on its own; a batch's duration is the sum of its operations.
 `;
 
 function buildRunningSection(schema: AdapterSchemaDocument): string {
@@ -1626,6 +1628,8 @@ function buildIntrospection(params: Record<string, unknown>) {
         _protocol: {
           version: schema.version,
           mode: "crude",
+          // Batches are accepted on every endpoint except EXECUTE.
+          capabilities: { batch: true, batch_max_operations: MAX_BATCH_OPERATIONS, batch_excluded_endpoints: ["EXECUTE"] },
         },
         operations: buildIntrospectionOperations(),
       },
@@ -1669,12 +1673,12 @@ type UpstreamCallContext = {
 // Node timers hold at most 2^31 - 1 ms; larger delays silently fire after 1 ms.
 const MAX_TIMER_MS = 2_147_483_647;
 
-function positiveIntegerEnv(name: string): number | undefined {
+function positiveIntegerEnv(name: string, unit = "milliseconds"): number | undefined {
   const raw = process.env[name]?.trim();
   if (!raw) return undefined;
   const value = /^\\d+$/.test(raw) ? Number(raw) : Number.NaN;
   if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_TIMER_MS) {
-    throw new Error(\`\${name} must be a positive integer number of milliseconds, at most \${MAX_TIMER_MS}.\`);
+    throw new Error(\`\${name} must be a positive integer number of \${unit}, at most \${MAX_TIMER_MS}.\`);
   }
   return value;
 }
@@ -1876,22 +1880,40 @@ async function runOperation(toolName: string, operation: string, params: Record<
   return proxyOperation(operation, params, call);
 }
 
-const MAX_BATCH_OPERATIONS = positiveIntegerEnv("MCPAQL_MAX_BATCH_OPERATIONS") ?? 25;
+const MAX_BATCH_OPERATIONS = positiveIntegerEnv("MCPAQL_MAX_BATCH_OPERATIONS", "operations") ?? 25;
 
 // An operation the host must approve on its own. The host's per-call prompt is the
-// confirmation, so a batch must never carry one: the batch halts there (spec 7.5).
-function requiresSingleCall(operation: string): boolean {
+// confirmation, so a batch must never carry one: the batch halts there (spec 7.5). Switching
+// the active tenant is single-call too: if it failed inside a batch, the rest of the batch
+// would run against the previous tenant.
+function singleCallReason(operation: string): string | undefined {
   const definition = TOOL_BY_OPERATION.get(operation)?.definition;
-  return Boolean(definition && (definition.requires_confirmation || definition.danger_level === "dangerous"));
+  if (!definition) return undefined;
+  if (definition.requires_confirmation) return "requires confirmation";
+  if (definition.danger_level === "dangerous") return "is dangerous";
+  if (definition.maps_to.startsWith("adapter:set_active_")) return "changes the active tenant for the operations after it";
+  return undefined;
+}
+
+function pendingEntry(entry: unknown, index: number) {
+  const record = entry && typeof entry === "object" && !Array.isArray(entry) ? entry as OperationArguments : undefined;
+  return {
+    index,
+    operation: typeof record?.operation === "string" ? record.operation : "",
+    params: record ? resolveParams(record) : {},
+  };
 }
 
 async function runBatch(toolName: string, entries: unknown[], call: UpstreamCallContext) {
-  if (toolName === TOOL_NAME_BY_ENDPOINT.EXECUTE) {
+  const endpoint = (Object.keys(TOOL_NAME_BY_ENDPOINT) as EndpointName[]).find((name) => TOOL_NAME_BY_ENDPOINT[name] === toolName);
+  if (!endpoint || endpoint === "EXECUTE") {
     return {
       success: false,
       error: {
         code: "VALIDATION_BATCH_NOT_ALLOWED",
-        message: \`\${toolName} does not accept batches; call each EXECUTE operation on its own so each one is approved.\`,
+        message: endpoint === "EXECUTE"
+          ? \`\${toolName} does not accept batches; call each EXECUTE operation on its own so each one is approved.\`
+          : \`Unknown endpoint tool '\${toolName}'.\`,
       },
     };
   }
@@ -1905,9 +1927,29 @@ async function runBatch(toolName: string, entries: unknown[], call: UpstreamCall
     };
   }
 
+  // Progress for a batch is reported per batch, so it only ever increases: operation i of n
+  // spans [i, i+1), filled in by the upstream's own progress when it reports a total.
+  const total = entries.length;
+  let lastProgress = -1;
+  const report = (progress: number, message: string) => {
+    if (!call.sendProgress || progress <= lastProgress) return;
+    lastProgress = progress;
+    void call.sendProgress({ progress, total, message }).catch(() => undefined);
+  };
+  const callFor = (index: number, operation: string): UpstreamCallContext => ({
+    ...call,
+    sendProgress: call.sendProgress
+      ? async (progress) => {
+          const fraction = progress.total ? Math.min(progress.progress / progress.total, 0.99) : 0;
+          report(index + fraction, \`\${operation}\${progress.message ? \`: \${progress.message}\` : ""}\`);
+        }
+      : undefined,
+  });
+
   const results: Array<{ index: number; operation: string; result: unknown }> = [];
   let succeeded = 0;
   for (const [index, entry] of entries.entries()) {
+    if (call.signal?.aborted) break;
     const record = entry && typeof entry === "object" && !Array.isArray(entry) ? entry as OperationArguments : undefined;
     const operation = typeof record?.operation === "string" ? record.operation : "";
     if (!record || !operation) {
@@ -1921,7 +1963,8 @@ async function runBatch(toolName: string, entries: unknown[], call: UpstreamCall
       results.push({ index, operation, result: await runOperation(toolName, operation, params, call) });
       continue;
     }
-    if (requiresSingleCall(operation)) {
+    const reason = singleCallReason(operation);
+    if (reason) {
       return {
         success: true,
         data: null,
@@ -1933,24 +1976,25 @@ async function runBatch(toolName: string, entries: unknown[], call: UpstreamCall
             success: false,
             error: {
               code: "VALIDATION_SINGLE_CALL_REQUIRED",
-              message: \`Operation '\${operation}' requires confirmation and must be called on its own, not in a batch.\`,
+              message: \`Operation '\${operation}' \${reason}, so it must be called on its own, not in a batch.\`,
             },
           },
         },
-        pending_operations: entries.slice(index + 1).map((pending, offset) => ({ index: index + 1 + offset, ...(pending as object) })),
-        summary: { total: entries.length, succeeded, failed: results.length - succeeded, halted: 1, pending: entries.length - index - 1 },
+        pending_operations: entries.slice(index + 1).map((pending, offset) => pendingEntry(pending, index + 1 + offset)),
+        summary: { total, succeeded, failed: results.length - succeeded, halted: 1, pending: total - index - 1 },
       };
     }
-    const result = await runOperation(toolName, operation, params, call) as { success?: boolean };
+    report(index, operation);
+    const result = await runOperation(toolName, operation, params, callFor(index, operation)) as { success?: boolean };
     if (result.success) succeeded += 1;
     results.push({ index, operation, result });
-    if (call.signal?.aborted) break;
   }
+  report(total, "batch complete");
   return {
     success: true,
     data: null,
     results,
-    summary: { total: entries.length, succeeded, failed: results.length - succeeded },
+    summary: { total, succeeded, failed: results.length - succeeded },
   };
 }
 
