@@ -1407,6 +1407,7 @@ type AdapterProvenance = {
 type OperationArguments = Record<string, unknown> & {
   operation?: unknown;
   params?: unknown;
+  operations?: unknown;
 };
 
 const schema = rawSchema as unknown as AdapterSchema;
@@ -1452,6 +1453,7 @@ function resolveParams(args: OperationArguments | undefined): Record<string, unk
   const clone = { ...args };
   delete clone.operation;
   delete clone.params;
+  delete clone.operations;
   return clone;
 }
 
@@ -1479,6 +1481,9 @@ function buildToolDescription(endpoint: EndpointName, operations: OperationDefin
     "",
     "Discover required parameters:",
     quickStart,
+    ...(endpoint === "EXECUTE"
+      ? ["", "Call EXECUTE operations one at a time; batches are not accepted."]
+      : ["", \`Batch independent operations: { operations: [{ operation, params }, ...] } (up to \${MAX_BATCH_OPERATIONS}).\`]),
   ].join("\\n");
 }
 
@@ -1811,20 +1816,34 @@ const server = new Server(
   { capabilities: { tools: {} } },
 );
 
+// EXECUTE takes one operation per call; the other endpoints also accept a batch.
+function endpointInputSchema(endpoint: EndpointKey): ListToolsResult["tools"][number]["inputSchema"] {
+  const properties: Record<string, object> = {
+    operation: { type: "string", description: "MCP-AQL operation name." },
+    params: { type: "object", description: "Operation parameters." },
+  };
+  if (endpoint === "execute") {
+    return { type: "object", properties, required: ["operation"] };
+  }
+  properties.operations = {
+    type: "array",
+    description: \`Batch: up to \${MAX_BATCH_OPERATIONS} { operation, params } entries run in order. Use instead of operation.\`,
+    items: {
+      type: "object",
+      properties: { operation: { type: "string" }, params: { type: "object" } },
+      required: ["operation"],
+    },
+  };
+  return { type: "object", properties };
+}
+
 server.setRequestHandler(ListToolsRequestSchema, async (): Promise<ListToolsResult> => ({
   tools: (Object.entries(schema.operations) as Array<[EndpointKey, OperationDefinition[] | undefined]>)
     .filter(([, operations]) => Array.isArray(operations) && operations.length > 0)
     .map(([endpoint, operations]) => ({
       name: TOOL_NAME_BY_ENDPOINT[endpoint.toUpperCase() as EndpointName],
       description: buildToolDescription(endpoint.toUpperCase() as EndpointName, operations ?? []),
-      inputSchema: {
-        type: "object",
-        properties: {
-          operation: { type: "string", description: "MCP-AQL operation name." },
-          params: { type: "object", description: "Operation parameters." },
-        },
-        required: ["operation"],
-      },
+      inputSchema: endpointInputSchema(endpoint),
       annotations: {
         // schema.operations keys are lowercase here because they come directly from the JSON schema document.
         readOnlyHint: endpoint === "read",
@@ -1833,42 +1852,132 @@ server.setRequestHandler(ListToolsRequestSchema, async (): Promise<ListToolsResu
     })),
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest, extra): Promise<CallToolResult> => {
-  const toolName = request.params.name;
-  const args = (request.params.arguments ?? {}) as OperationArguments;
-  const operation = typeof args.operation === "string" ? args.operation : "";
-  const params = resolveParams(args);
-
+async function runOperation(toolName: string, operation: string, params: Record<string, unknown>, call: UpstreamCallContext) {
   if (operation === "introspect") {
-    const result = buildIntrospection(params);
-    return textResult(result);
+    return buildIntrospection(params);
   }
 
   const item = TOOL_BY_OPERATION.get(operation);
   if (!item) {
-    return textResult({ success: false, error: { code: "NOT_FOUND_OPERATION", message: \`Unknown operation: \${operation}\` } });
+    return { success: false, error: { code: "NOT_FOUND_OPERATION", message: \`Unknown operation: \${operation}\` } };
   }
 
   const expectedToolName = TOOL_NAME_BY_ENDPOINT[item.endpoint];
   if (toolName !== expectedToolName) {
-    return textResult({
+    return {
       success: false,
       error: {
         code: "VALIDATION_WRONG_ENDPOINT",
         message: \`Operation '\${operation}' must be called via \${expectedToolName}.\`,
       },
-    });
+    };
   }
 
+  return proxyOperation(operation, params, call);
+}
+
+const MAX_BATCH_OPERATIONS = positiveIntegerEnv("MCPAQL_MAX_BATCH_OPERATIONS") ?? 25;
+
+// An operation the host must approve on its own. The host's per-call prompt is the
+// confirmation, so a batch must never carry one: the batch halts there (spec 7.5).
+function requiresSingleCall(operation: string): boolean {
+  const definition = TOOL_BY_OPERATION.get(operation)?.definition;
+  return Boolean(definition && (definition.requires_confirmation || definition.danger_level === "dangerous"));
+}
+
+async function runBatch(toolName: string, entries: unknown[], call: UpstreamCallContext) {
+  if (toolName === TOOL_NAME_BY_ENDPOINT.EXECUTE) {
+    return {
+      success: false,
+      error: {
+        code: "VALIDATION_BATCH_NOT_ALLOWED",
+        message: \`\${toolName} does not accept batches; call each EXECUTE operation on its own so each one is approved.\`,
+      },
+    };
+  }
+  if (entries.length === 0 || entries.length > MAX_BATCH_OPERATIONS) {
+    return {
+      success: false,
+      error: {
+        code: "VALIDATION_BATCH_SIZE",
+        message: \`A batch needs 1 to \${MAX_BATCH_OPERATIONS} operations; got \${entries.length}.\`,
+      },
+    };
+  }
+
+  const results: Array<{ index: number; operation: string; result: unknown }> = [];
+  let succeeded = 0;
+  for (const [index, entry] of entries.entries()) {
+    const record = entry && typeof entry === "object" && !Array.isArray(entry) ? entry as OperationArguments : undefined;
+    const operation = typeof record?.operation === "string" ? record.operation : "";
+    if (!record || !operation) {
+      results.push({ index, operation, result: { success: false, error: { code: "VALIDATION_MISSING_OPERATION", message: "Batch entry needs an operation name." } } });
+      continue;
+    }
+    const params = resolveParams(record);
+    // Routing comes first: an operation from another endpoint is refused here and never runs.
+    const item = TOOL_BY_OPERATION.get(operation);
+    if (item && TOOL_NAME_BY_ENDPOINT[item.endpoint] !== toolName) {
+      results.push({ index, operation, result: await runOperation(toolName, operation, params, call) });
+      continue;
+    }
+    if (requiresSingleCall(operation)) {
+      return {
+        success: true,
+        data: null,
+        results,
+        halted_at: {
+          index,
+          operation,
+          result: {
+            success: false,
+            error: {
+              code: "VALIDATION_SINGLE_CALL_REQUIRED",
+              message: \`Operation '\${operation}' requires confirmation and must be called on its own, not in a batch.\`,
+            },
+          },
+        },
+        pending_operations: entries.slice(index + 1).map((pending, offset) => ({ index: index + 1 + offset, ...(pending as object) })),
+        summary: { total: entries.length, succeeded, failed: results.length - succeeded, halted: 1, pending: entries.length - index - 1 },
+      };
+    }
+    const result = await runOperation(toolName, operation, params, call) as { success?: boolean };
+    if (result.success) succeeded += 1;
+    results.push({ index, operation, result });
+    if (call.signal?.aborted) break;
+  }
+  return {
+    success: true,
+    data: null,
+    results,
+    summary: { total: entries.length, succeeded, failed: results.length - succeeded },
+  };
+}
+
+server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest, extra): Promise<CallToolResult> => {
+  const toolName = request.params.name;
+  const args = (request.params.arguments ?? {}) as OperationArguments;
   const progressToken = request.params._meta?.progressToken;
-  const result = await proxyOperation(operation, params, {
+  const call: UpstreamCallContext = {
     signal: extra.signal,
     progressToken,
     sendProgress: progressToken === undefined
       ? undefined
       : (progress) => extra.sendNotification({ method: "notifications/progress", params: { ...progress, progressToken } }),
-  });
-  return textResult(result);
+  };
+
+  if (Array.isArray(args.operations)) {
+    if (args.operation !== undefined) {
+      return textResult({
+        success: false,
+        error: { code: "VALIDATION_AMBIGUOUS_REQUEST", message: "Send either operation or operations, not both." },
+      });
+    }
+    return textResult(await runBatch(toolName, args.operations, call));
+  }
+
+  const operation = typeof args.operation === "string" ? args.operation : "";
+  return textResult(await runOperation(toolName, operation, resolveParams(args), call));
 });
 
 const transport = new StdioServerTransport();
