@@ -55,6 +55,30 @@ server.registerTool("aborted_count", {}, async () => ({
   structuredContent: { aborted },
 }));
 
+// Returns an Evidence-shaped record of about `size` characters, the same data as text and
+// structuredContent, plus the argument names it received.
+server.registerTool(
+  "big",
+  // _full_result is declared so the test can see if the adapter ever forwards it.
+  { inputSchema: { size: z.number(), _full_result: z.boolean().optional() } },
+  async (args) => {
+    const record = {
+      evidence_id: "ev_fixture",
+      limitations: ["fixture"],
+      normalized_result: { coverage: { status: "complete" }, payload: "x".repeat(args.size) },
+      received: Object.keys(args).sort(),
+    };
+    return { content: [{ type: "text", text: JSON.stringify(record) }], structuredContent: record };
+  },
+);
+
+server.registerTool("plain", {}, async () => ({ content: [{ type: "text", text: "text only" }] }));
+
+server.registerTool("view", { inputSchema: { source: z.object({ evidence_id: z.string() }) } }, async ({ source }) => ({
+  content: [{ type: "text", text: source.evidence_id }],
+  structuredContent: { viewed: source.evidence_id },
+}));
+
 server.registerTool("crash", {}, async () => {
   setImmediate(() => process.exit(3));
   return new Promise(() => {});

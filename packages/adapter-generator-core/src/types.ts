@@ -129,8 +129,38 @@ export interface AdapterStdioTarget {
   env?: Record<string, string>;
 }
 
+/**
+ * Opt-in shaping of successful upstream results, applied by the generated adapter. With no
+ * result_shaping, results pass through unchanged.
+ */
+export interface AdapterResultShaping {
+  /**
+   * Over this many characters (serialized result data), operations with a handle rule return a
+   * summary and a continuation instead of the full result. 0 disables; the adapter's
+   * MCPAQL_RESULT_BUDGET_CHARS overrides it.
+   */
+  max_result_chars?: number;
+  /** Drop text content blocks that are JSON for exactly the structuredContent (the same data twice). */
+  drop_duplicate_text?: boolean;
+  handles?: AdapterResultHandle[];
+}
+
+/** How to replace an oversized result with a retained-result handle the model can page. */
+export interface AdapterResultHandle {
+  /** READ operations whose results the upstream retains and can serve again through `continuation`. */
+  operations: string[];
+  /** Dotted path of the handle id inside structuredContent, e.g. "evidence_id". */
+  id_path: string;
+  /** Dotted structuredContent paths always kept in the summary (identity, coverage, limitations, ...). */
+  keep_paths: string[];
+  /** Ready-to-call follow-up; every string exactly "${handle}" is replaced with the id. */
+  continuation: { operation: string; params: Record<string, unknown> };
+}
+
 export interface SchemaBuildOverrides {
   tenancy?: AdapterTenancy;
+  /** Copied into the adapter schema after validation against the final operation set. */
+  result_shaping?: AdapterResultShaping;
   /**
    * Endpoints whose operations are left out of the adapter entirely (after per-operation
    * endpoint overrides apply), e.g. ["EXECUTE"] to ship a staged adapter with no runtime
@@ -222,6 +252,8 @@ export interface AdapterSchemaDocument {
   headers?: Record<string, string>;
   /** Present when the upstream is tenant-scoped; see AdapterTenancy. */
   tenancy?: AdapterTenancy;
+  /** Opt-in result shaping; see AdapterResultShaping. */
+  result_shaping?: AdapterResultShaping;
   operations: {
     create?: AdapterSchemaOperation[];
     read: AdapterSchemaOperation[];
