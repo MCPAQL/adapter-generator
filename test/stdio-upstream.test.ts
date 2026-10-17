@@ -35,7 +35,12 @@ function operation(name: string, endpoint: DiscoveryOperation["endpoint"]): Disc
     review_reasons: [],
     params: name === "echo"
       ? [{ name: "message", original_name: "message", type: "string", required: true, source_path: "message" }]
-      : [],
+      : name === "slow"
+        ? [
+            { name: "ms", original_name: "ms", type: "number", required: true, source_path: "ms" },
+            { name: "progress_every_ms", original_name: "progress_every_ms", type: "number", required: false, source_path: "progress_every_ms" },
+          ]
+        : [],
     maps_to: `tool:${name}`,
   };
 }
@@ -56,7 +61,14 @@ const stdioBundle: DiscoveryBundle = {
     },
   },
   normalized_bundle: {
-    operations: [operation("echo", "READ"), operation("count", "READ"), operation("env_keys", "READ"), operation("crash", "EXECUTE")],
+    operations: [
+      operation("echo", "READ"),
+      operation("count", "READ"),
+      operation("env_keys", "READ"),
+      operation("slow", "READ"),
+      operation("aborted_count", "READ"),
+      operation("crash", "EXECUTE"),
+    ],
     warnings: [],
   },
 };
@@ -223,7 +235,9 @@ test("generated stdio adapter typechecks and proxies to a live stdio upstream", 
   assert.equal(first.data.structured_content.pid, second.data.structured_content.pid);
 
   // A crash fails the in-flight call, the next call reports the lost session once, then a fresh child starts.
-  await assert.rejects(client.callTool({ name: "mcp_aql_execute", arguments: { operation: "crash" } }));
+  const crashed = parse(await client.callTool({ name: "mcp_aql_execute", arguments: { operation: "crash" } }));
+  assert.equal(crashed.success, false);
+  assert.equal(crashed.error.code, "UPSTREAM_CALL_FAILED");
   const notice = parse(await client.callTool({ name: "mcp_aql_read", arguments: { operation: "count" } }));
   assert.equal(notice.success, false);
   assert.equal(notice.error.code, "UPSTREAM_UNAVAILABLE");
@@ -355,6 +369,7 @@ test("bearer auth on a stdio capture is dropped with a warning", () => {
   });
   assert.equal(output.schema.auth, undefined);
   assert.ok(output.warnings.some((warning) => warning.code === "STDIO_AUTH_IGNORED"));
+  assert.equal(output.metadata.warning_count, output.warnings.length);
 });
 
 test("stopping the adapter while its child is still starting reaps the child", async (t) => {
@@ -387,9 +402,11 @@ test("stopping the adapter while its child is still starting reaps the child", a
   let childPid: number | undefined;
   const deadline = Date.now() + 10_000;
   while (childPid === undefined && Date.now() < deadline) {
-    try {
-      childPid = Number(await readFile(pidFile, "utf8"));
-    } catch {
+    // The file can exist before its contents are written; only a positive pid counts.
+    const pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
+    if (Number.isInteger(pid) && pid > 0) {
+      childPid = pid;
+    } else {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
@@ -399,4 +416,84 @@ test("stopping the adapter while its child is still starting reaps the child", a
   adapter.kill("SIGTERM");
   await exited;
   assert.ok(await waitForExit(childPid!, 10_000), `starting child ${childPid} was orphaned`);
+});
+
+async function connectAdapter(t: { after: (fn: () => unknown) => void }, env: Record<string, string> = {}) {
+  const dir = await writeGeneratedAdapter();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const client = new Client({ name: "stdio-adapter-call-control", version: "0.0.0" });
+  await client.connect(new StdioClientTransport({
+    command: process.execPath,
+    args: ["--import", "tsx", "src/server.ts"],
+    cwd: dir,
+    env: { ...getDefaultEnvironment(), FIXTURE_SOURCE: "s", ...env },
+    stderr: "ignore",
+  }));
+  t.after(() => client.close());
+  return client;
+}
+
+const slow = (ms: number, progressEveryMs?: number) => ({
+  name: "mcp_aql_read",
+  arguments: { operation: "slow", params: { ms, ...(progressEveryMs ? { progress_every_ms: progressEveryMs } : {}) } },
+});
+
+test("upstream progress is forwarded to a caller that asked for it", async (t) => {
+  const client = await connectAdapter(t);
+  const events: Array<{ progress: number; message?: string }> = [];
+  const result = parse(await client.callTool(slow(450, 100), undefined, { onprogress: (progress) => events.push(progress) }));
+  assert.equal(result.success, true);
+  assert.ok(events.length >= 3, `expected forwarded progress, got ${events.length}`);
+  assert.equal(events[0].message, "step 1");
+});
+
+test("the upstream deadline returns UPSTREAM_TIMEOUT and is extended by progress", async (t) => {
+  const client = await connectAdapter(t, { MCPAQL_UPSTREAM_TIMEOUT_MS: "300" });
+  const silent = parse(await client.callTool(slow(1200)));
+  assert.equal(silent.success, false);
+  assert.equal(silent.error.code, "UPSTREAM_TIMEOUT");
+  assert.equal(silent.error.details.timeout_ms, 300);
+  // Progress every 100 ms keeps resetting the 300 ms deadline, even though this caller did not ask for progress.
+  const reporting = parse(await client.callTool(slow(1200, 100)));
+  assert.equal(reporting.success, true);
+});
+
+test("MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS caps calls that keep reporting progress", async (t) => {
+  const client = await connectAdapter(t, { MCPAQL_UPSTREAM_TIMEOUT_MS: "300", MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS: "600" });
+  const result = parse(await client.callTool(slow(2000, 100)));
+  assert.equal(result.success, false);
+  assert.equal(result.error.code, "UPSTREAM_TIMEOUT");
+});
+
+test("cancelling the downstream request cancels the upstream call", async (t) => {
+  const client = await connectAdapter(t);
+  const controller = new AbortController();
+  const pending = client.callTool(slow(5000), undefined, { signal: controller.signal });
+  setTimeout(() => controller.abort(), 300);
+  await assert.rejects(pending);
+  // Give the cancellation notification time to reach the upstream.
+  let aborted = 0;
+  const deadline = Date.now() + 3000;
+  while (aborted === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    aborted = parse(await client.callTool({ name: "mcp_aql_read", arguments: { operation: "aborted_count" } })).data.structured_content.aborted;
+  }
+  assert.equal(aborted, 1);
+});
+
+test("an invalid timeout setting is reported, not ignored", async (t) => {
+  const dir = await writeGeneratedAdapter();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+    const child = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
+      cwd: dir,
+      env: { ...getDefaultEnvironment(), MCPAQL_UPSTREAM_TIMEOUT_MS: "soon" },
+      stdio: ["pipe", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr!.on("data", (chunk) => { stderr += chunk; });
+    child.on("exit", (code) => resolve({ code, stderr }));
+  });
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /MCPAQL_UPSTREAM_TIMEOUT_MS must be a positive integer/);
 });

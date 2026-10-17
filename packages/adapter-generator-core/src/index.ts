@@ -346,6 +346,17 @@ export function buildSchemaFromDiscoveryBundle(options: {
     schema.operations[key] = list;
   }
 
+  const builderWarnings: SchemaBuildOutput["warnings"] = isStdioTransport && bundle.source.auth.type === "bearer"
+    ? [
+        {
+          code: "STDIO_AUTH_IGNORED",
+          severity: "warning",
+          message: "Bearer auth does not apply to stdio upstreams and was dropped; pass credentials with overrides.stdio.env \"${env:VAR}\" references or env_passthrough.",
+        },
+      ]
+    : [];
+  const warnings = [...bundle.normalized_bundle.warnings, ...builderWarnings];
+
   return {
     schema,
     metadata: {
@@ -353,7 +364,7 @@ export function buildSchemaFromDiscoveryBundle(options: {
       source_server_name: bundle.source.server?.name,
       source_server_version: bundle.source.server?.version,
       source_capture_name: bundle.source.name,
-      warning_count: bundle.normalized_bundle.warnings.length,
+      warning_count: warnings.length,
       operation_count: operations.length,
       operations: operations.map((operation) => {
         const paramMappings = Object.fromEntries(
@@ -372,16 +383,7 @@ export function buildSchemaFromDiscoveryBundle(options: {
         };
       }),
     },
-    warnings: isStdioTransport && bundle.source.auth.type === "bearer"
-      ? [
-          ...bundle.normalized_bundle.warnings,
-          {
-            code: "STDIO_AUTH_IGNORED",
-            severity: "warning",
-            message: "Bearer auth does not apply to stdio upstreams and was dropped; pass credentials with overrides.stdio.env \"${env:VAR}\" references or env_passthrough.",
-          },
-        ]
-      : bundle.normalized_bundle.warnings,
+    warnings,
   };
 }
 
@@ -1274,7 +1276,9 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
+  ErrorCode,
   ListToolsRequestSchema,
+  McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import type {
   CallToolRequest,
@@ -1597,7 +1601,39 @@ function buildIntrospection(params: Record<string, unknown>) {
   };
 }
 
-async function proxyOperation(operationName: string, params: Record<string, unknown>) {
+type UpstreamCallContext = {
+  signal?: AbortSignal;
+  progressToken?: string | number;
+  sendProgress?: (progress: { progress: number; total?: number; message?: string }) => Promise<void>;
+};
+
+function positiveIntegerEnv(name: string): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(\`\${name} must be a positive integer number of milliseconds.\`);
+  }
+  return value;
+}
+
+// Per-call upstream deadline. Upstream progress notifications reset it, so long analyses that
+// report progress keep running; MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS caps them regardless.
+const UPSTREAM_TIMEOUT_MS = positiveIntegerEnv("MCPAQL_UPSTREAM_TIMEOUT_MS") ?? 60_000;
+const UPSTREAM_MAX_TOTAL_TIMEOUT_MS = positiveIntegerEnv("MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS");
+
+function upstreamCallError(error: unknown, call: UpstreamCallContext | undefined, sourceTool: string) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (call?.signal?.aborted) {
+    return { success: false, error: { code: "CANCELLED", message: \`Call to upstream tool '\${sourceTool}' was cancelled.\` } };
+  }
+  if (error instanceof McpError && error.code === ErrorCode.RequestTimeout) {
+    return { success: false, error: { code: "UPSTREAM_TIMEOUT", message, details: { source_tool: sourceTool, timeout_ms: UPSTREAM_TIMEOUT_MS } } };
+  }
+  return { success: false, error: { code: "UPSTREAM_CALL_FAILED", message, details: { source_tool: sourceTool } } };
+}
+
+async function proxyOperation(operationName: string, params: Record<string, unknown>, call?: UpstreamCallContext) {
   const item = TOOL_BY_OPERATION.get(operationName);
   if (!item) {
     return {
@@ -1634,10 +1670,31 @@ ${tenancy ? `  let tenant: TenantRef | undefined;
   }`}
   const sourceTool = item.definition.maps_to.replace(/^tool:/, "");
   const upstreamParams = mapParamsToUpstream(operationName, params);
-  const result = await upstream.callTool({
-    name: sourceTool,
-    arguments: upstreamParams,
-  });
+  let result: Awaited<ReturnType<Client["callTool"]>>;
+  try {
+    result = await upstream.callTool(
+      { name: sourceTool, arguments: upstreamParams },
+      undefined,
+      {
+        // Cancelling the downstream request cancels the upstream call (notifications/cancelled).
+        signal: call?.signal,
+        timeout: UPSTREAM_TIMEOUT_MS,
+        resetTimeoutOnProgress: true,
+        ...(UPSTREAM_MAX_TOTAL_TIMEOUT_MS ? { maxTotalTimeout: UPSTREAM_MAX_TOTAL_TIMEOUT_MS } : {}),
+        // Always ask the upstream for progress so it can extend the deadline; forward it only
+        // when the caller asked for progress on this request.
+        onprogress: (progress) => {
+          if (call?.progressToken !== undefined && call.sendProgress) {
+            void call.sendProgress(progress).catch(() => undefined);
+          }
+        },
+      },
+    );
+  } catch (error) {
+    return {
+      ...upstreamCallError(error, call, sourceTool),
+${tenancy ? "      _meta: tenantMeta,\n" : ""}    };
+  }
 
   if (result.isError) {
     return {
@@ -1692,7 +1749,7 @@ server.setRequestHandler(ListToolsRequestSchema, async (): Promise<ListToolsResu
     })),
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest): Promise<CallToolResult> => {
+server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest, extra): Promise<CallToolResult> => {
   const toolName = request.params.name;
   const args = (request.params.arguments ?? {}) as OperationArguments;
   const operation = typeof args.operation === "string" ? args.operation : "";
@@ -1719,7 +1776,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
     });
   }
 
-  const result = await proxyOperation(operation, params);
+  const progressToken = request.params._meta?.progressToken;
+  const result = await proxyOperation(operation, params, {
+    signal: extra.signal,
+    progressToken,
+    sendProgress: progressToken === undefined
+      ? undefined
+      : (progress) => extra.sendNotification({ method: "notifications/progress", params: { ...progress, progressToken } }),
+  });
   return textResult(result);
 });
 
