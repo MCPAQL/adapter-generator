@@ -1121,6 +1121,7 @@ async function getUpstreamClient(): Promise<Client> {
  */
 const STDIO_UPSTREAM_RUNTIME = `let upstreamClient: Client | undefined;
 let upstreamTransport: StdioClientTransport | undefined;
+let upstreamConnecting: Promise<Client> | undefined;
 let upstreamExitNotice: string | undefined;
 let closingUpstream = false;
 
@@ -1165,16 +1166,26 @@ function buildChildEnvironment(): Record<string, string> {
   return env;
 }
 
+// Concurrent first calls share one in-flight connection, so the adapter never runs two children.
 async function getUpstreamClient(): Promise<Client> {
   if (upstreamClient) {
     return upstreamClient;
+  }
+  if (upstreamConnecting) {
+    return upstreamConnecting;
   }
   if (upstreamExitNotice) {
     const notice = upstreamExitNotice;
     upstreamExitNotice = undefined;
     throw new Error(notice);
   }
+  upstreamConnecting = connectUpstream().finally(() => {
+    upstreamConnecting = undefined;
+  });
+  return upstreamConnecting;
+}
 
+async function connectUpstream(): Promise<Client> {
   const stdio = resolveStdioTarget();
   const transport = new StdioClientTransport({
     command: stdio.command,
@@ -1192,7 +1203,17 @@ async function getUpstreamClient(): Promise<Client> {
       upstreamExitNotice = "The upstream process exited and its session state was lost. Retry to start a fresh upstream.";
     }
   };
-  await client.connect(transport);
+  try {
+    await client.connect(transport);
+  } catch (error) {
+    await transport.close();
+    throw error;
+  }
+  // Shutdown may have started while the child was starting; it could not see this transport yet.
+  if (closingUpstream) {
+    await transport.close();
+    throw new Error("The adapter is shutting down.");
+  }
   upstreamClient = client;
   upstreamTransport = transport;
   return upstreamClient;
@@ -1674,14 +1695,24 @@ ${tenancy ? "  await closeTenantClients();\n" : ""}${stdio ? "  closingUpstream 
   }
 }
 
+let shuttingDown = false;
+function shutdown(): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  void closeUpstreamTransport().finally(() => process.exit(0));
+}
+
 process.on("beforeExit", async () => {
   await closeUpstreamTransport();
 });
 
+// A host may end the session by closing the adapter's stdin without a signal. An open
+// upstream connection keeps the event loop alive, so beforeExit alone would never fire.
+server.onclose = shutdown;
+process.stdin.on("end", shutdown);
+
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => {
-    void closeUpstreamTransport().finally(() => process.exit(0));
-  });
+  process.on(signal, shutdown);
 }
 `;
 }

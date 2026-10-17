@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
+import readline from "node:readline";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -243,4 +245,75 @@ test("generated stdio adapter typechecks and proxies to a live stdio upstream", 
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   assert.fail(`upstream child ${childPid} still running after adapter close`);
+});
+
+async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+test("concurrent first calls share one upstream child", async (t) => {
+  const dir = await writeGeneratedAdapter();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const client = new Client({ name: "stdio-adapter-race", version: "0.0.0" });
+  await client.connect(new StdioClientTransport({
+    command: process.execPath,
+    args: ["--import", "tsx", "src/server.ts"],
+    cwd: dir,
+    env: { ...getDefaultEnvironment(), FIXTURE_SOURCE: "s" },
+    stderr: "ignore",
+  }));
+  t.after(() => client.close());
+
+  const results = await Promise.all(
+    [0, 1, 2].map(() => client.callTool({ name: "mcp_aql_read", arguments: { operation: "count" } }).then(parse)),
+  );
+  const pids = new Set(results.map((result) => result.data.structured_content.pid));
+  assert.equal(pids.size, 1);
+  assert.deepEqual(results.map((result) => result.data.structured_content.calls).sort(), [1, 2, 3]);
+});
+
+test("closing the adapter's stdin without a signal stops the adapter and its child", async (t) => {
+  const dir = await writeGeneratedAdapter();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const adapter = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
+    cwd: dir,
+    env: { ...getDefaultEnvironment(), FIXTURE_SOURCE: "s" },
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  t.after(() => adapter.kill("SIGKILL"));
+  const lines = readline.createInterface({ input: adapter.stdout! });
+  const responses = new Map<number, (message: any) => void>();
+  lines.on("line", (line) => {
+    const message = JSON.parse(line);
+    responses.get(message.id)?.(message);
+  });
+  const request = (id: number, method: string, params: unknown) =>
+    new Promise<any>((resolve) => {
+      responses.set(id, resolve);
+      adapter.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    });
+
+  await request(1, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "0" } });
+  adapter.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+  const call = await request(2, "tools/call", { name: "mcp_aql_read", arguments: { operation: "count" } });
+  const childPid: number = JSON.parse(call.result.content[0].text).data.structured_content.pid;
+
+  const exited = once(adapter, "exit");
+  adapter.stdin!.end();
+  const [code, signal] = await Promise.race([
+    exited,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("adapter did not exit after stdin closed")), 10_000)),
+  ]);
+  assert.equal(signal, null);
+  assert.equal(code, 0);
+  assert.ok(await waitForExit(childPid, 10_000), `upstream child ${childPid} still running`);
 });
