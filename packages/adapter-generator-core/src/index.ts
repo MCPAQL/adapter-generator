@@ -54,6 +54,14 @@ const VALID_ENDPOINTS = new Set(["CREATE", "READ", "UPDATE", "DELETE", "EXECUTE"
 const VALID_DANGER_LEVELS = new Set(["safe", "reversible", "destructive", "dangerous"]);
 
 function validateOverrides(overrides?: SchemaBuildOverrides): void {
+  if (overrides?.exclude_endpoints !== undefined && !Array.isArray(overrides.exclude_endpoints)) {
+    throw new Error("exclude_endpoints must be an array of endpoint names.");
+  }
+  for (const endpoint of overrides?.exclude_endpoints ?? []) {
+    if (!VALID_ENDPOINTS.has(endpoint)) {
+      throw new Error(`Invalid exclude_endpoints entry '${endpoint}'.`);
+    }
+  }
   if (!overrides?.operations) {
     return;
   }
@@ -63,10 +71,17 @@ function validateOverrides(overrides?: SchemaBuildOverrides): void {
       throw new Error(`Invalid override endpoint '${value.endpoint}' for operation key '${key}'.`);
     }
 
+    if (value.exclude !== undefined && typeof value.exclude !== "boolean") {
+      throw new Error(`Override exclude for operation key '${key}' must be a boolean.`);
+    }
+    if (value.exclude_reason !== undefined && value.exclude !== true) {
+      throw new Error(`Override for operation key '${key}' sets exclude_reason without exclude: true.`);
+    }
+
     const dangerLevel = value.danger_level as string | undefined;
     if (dangerLevel && !VALID_DANGER_LEVELS.has(dangerLevel)) {
       if (dangerLevel === "forbidden") {
-        throw new Error(`Overrides cannot set danger_level to 'forbidden' for operation key '${key}' - remove the operation from the bundle instead.`);
+        throw new Error(`Overrides cannot set danger_level to 'forbidden' for operation key '${key}' - set exclude: true to leave the operation out instead.`);
       }
 
       throw new Error(`Invalid override danger_level '${dangerLevel}' for operation key '${key}'.`);
@@ -260,7 +275,37 @@ export function buildSchemaFromDiscoveryBundle(options: {
   const overrides = options.overrides;
   validateOverrides(overrides);
 
-  const operations = bundle.normalized_bundle.operations.map((operation) => applyOverrides(operation, overrides?.operations));
+  const overridden = bundle.normalized_bundle.operations.map((operation) => applyOverrides(operation, overrides?.operations));
+  const excludedEndpoints = new Set(overrides?.exclude_endpoints ?? []);
+  const excludedOperations: NonNullable<SchemaBuildOutput["metadata"]["excluded_operations"]> = [];
+
+  // Exclusion is a safety control, so it fails closed: an exclude key that names no operation
+  // is an error, and an operation is excluded if any override that names it says so (by source
+  // tool name, bundle operation name, or the name an override renamed it to).
+  const excludeKeys = Object.entries(overrides?.operations ?? {}).filter(([, value]) => value.exclude === true).map(([key]) => key);
+  const namesFor = (index: number) => {
+    const source = bundle.normalized_bundle.operations[index];
+    return [source.source_tool_name, source.operation_name, overridden[index].operation_name];
+  };
+  for (const key of excludeKeys) {
+    if (!overridden.some((_, index) => namesFor(index).includes(key))) {
+      throw new Error(`Override '${key}' sets exclude, but no operation in the bundle has that name.`);
+    }
+  }
+  const operations = overridden.filter((operation, index) => {
+    const excludingKey = namesFor(index).find((name) => excludeKeys.includes(name));
+    const reason = excludingKey
+      ? overrides?.operations?.[excludingKey]?.exclude_reason ?? "excluded by operation override"
+      : excludedEndpoints.has(operation.endpoint) ? `endpoint ${operation.endpoint} excluded by exclude_endpoints` : undefined;
+    if (!reason) return true;
+    excludedOperations.push({
+      source_tool_name: operation.source_tool_name,
+      operation_name: operation.operation_name,
+      endpoint: operation.endpoint,
+      reason,
+    });
+    return false;
+  });
   const adapterName = overrides?.adapter?.name ?? `${bundle.source.name}-adapter`;
   const tokenEnv = overrides?.adapter?.token_env ?? bundle.source.auth.token_env;
 
@@ -355,6 +400,7 @@ export function buildSchemaFromDiscoveryBundle(options: {
       source_capture_name: bundle.source.name,
       warning_count: bundle.normalized_bundle.warnings.length,
       operation_count: operations.length,
+      ...(excludedOperations.length > 0 ? { excluded_operations: excludedOperations } : {}),
       operations: operations.map((operation) => {
         const paramMappings = Object.fromEntries(
           operation.params
@@ -1892,6 +1938,16 @@ export function generateAdapterPackage(options: {
   const hasTemplates = options.templates !== undefined
     && Object.keys(options.templates.templates ?? {}).length > 0;
   if (hasTemplates) {
+    // A template with the name of an excluded operation would re-add what the schema build left out.
+    const excluded = new Set(
+      ((provenance as { excluded_operations?: Array<{ operation_name?: unknown }> }).excluded_operations ?? [])
+        .map((entry) => entry.operation_name)
+        .filter((name): name is string => typeof name === "string"),
+    );
+    const reintroduced = Object.keys(options.templates!.templates ?? {}).filter((name) => excluded.has(name));
+    if (reintroduced.length > 0) {
+      throw new Error(`Templates cannot re-add excluded operations: ${reintroduced.join(", ")}.`);
+    }
     validateTemplates(options.templates!, schema);
     schema = applyTemplatesToSchema(schema, options.templates!);
   }
