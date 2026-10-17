@@ -30,4 +30,16 @@ server.registerTool("crash", {}, async () => {
   return new Promise(() => {});
 });
 
+// Optional slow start, for tests that stop the adapter while the child is still starting.
+// The pid file lets them check the child is reaped; EPIPE is ignored so only the adapter's
+// cleanup, not a failed write, can end the child.
+if (process.env.FIXTURE_PID_FILE) {
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(process.env.FIXTURE_PID_FILE, String(process.pid));
+}
+if (process.env.FIXTURE_START_DELAY_MS) {
+  process.stdout.on("error", () => {});
+  await new Promise((resolve) => setTimeout(resolve, Number(process.env.FIXTURE_START_DELAY_MS)));
+}
+
 await server.connect(new StdioServerTransport());

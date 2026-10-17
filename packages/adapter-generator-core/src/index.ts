@@ -181,6 +181,7 @@ function toSchemaOperation(operation: DiscoveryOperation): AdapterSchemaOperatio
 }
 
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const REDACTED = "<redacted>";
 
 function stringArray(value: unknown, label: string): string[] | undefined {
   if (value === undefined) return undefined;
@@ -190,20 +191,32 @@ function stringArray(value: unknown, label: string): string[] | undefined {
   return value as string[];
 }
 
-// Captured launch config is merged with overrides field by field, so an override can pin
-// args (e.g. an exact package version) without restating the command.
+// Each launch field comes from overrides when set, otherwise from the capture, so an override
+// can pin args (e.g. an exact package version) without restating the command. An override
+// replaces a whole field: overrides.stdio.env replaces the captured env, it is not merged per key.
 function resolveStdioTarget(
   captured: Record<string, unknown> | undefined,
   override: Partial<AdapterStdioTarget> | undefined,
 ): AdapterStdioTarget {
-  const command = override?.command ?? captured?.command;
+  const pick = (field: keyof AdapterStdioTarget): unknown =>
+    override && override[field] !== undefined ? override[field] : captured?.[field];
+
+  const command = pick("command");
   if (typeof command !== "string" || command.trim() === "") {
     throw new Error("stdio transport requires a command (capture config or overrides.stdio.command).");
   }
-  const args = override?.args ?? stringArray(captured?.args, "args");
-  const cwd = override?.cwd ?? (typeof captured?.cwd === "string" ? captured.cwd : undefined);
-  const envPassthrough = override?.env_passthrough ?? stringArray(captured?.env_passthrough, "env_passthrough");
-  const env = override?.env ?? (captured?.env as Record<string, string> | undefined);
+  const args = stringArray(pick("args"), "args");
+  const cwdValue = pick("cwd");
+  if (cwdValue !== undefined && typeof cwdValue !== "string") {
+    throw new Error("stdio cwd must be a string.");
+  }
+  const cwd = cwdValue as string | undefined;
+  const envPassthrough = stringArray(pick("env_passthrough"), "env_passthrough");
+  const envValue = pick("env");
+  if (envValue !== undefined && (envValue === null || typeof envValue !== "object" || Array.isArray(envValue))) {
+    throw new Error("stdio env must be an object of string values.");
+  }
+  const env = envValue as Record<string, unknown> | undefined;
 
   for (const name of [...(envPassthrough ?? []), ...Object.keys(env ?? {})]) {
     if (!ENV_NAME_PATTERN.test(name)) throw new Error(`Invalid stdio environment variable name '${name}'.`);
@@ -211,13 +224,26 @@ function resolveStdioTarget(
   for (const [name, value] of Object.entries(env ?? {})) {
     if (typeof value !== "string") throw new Error(`stdio env value for '${name}' must be a string.`);
   }
+  // Discovery redacts secret-looking launch values. Launching with the placeholder would fail
+  // upstream auth with no hint, so require the value to be supplied explicitly instead.
+  const redacted = [
+    ...(command.includes(REDACTED) ? ["command"] : []),
+    ...(args ?? []).flatMap((arg, index) => (arg.includes(REDACTED) ? [`args[${index}]`] : [])),
+    ...Object.entries(env ?? {}).flatMap(([name, value]) => (String(value).includes(REDACTED) ? [`env.${name}`] : [])),
+  ];
+  if (redacted.length > 0) {
+    throw new Error(
+      `stdio launch config contains redacted values (${redacted.join(", ")}). Supply them in overrides.stdio, `
+      + "using \"${env:VAR}\" references for secrets so they are read at spawn time and never written into the schema.",
+    );
+  }
 
   return {
     command,
     ...(args && args.length > 0 ? { args } : {}),
     ...(cwd ? { cwd } : {}),
     ...(envPassthrough && envPassthrough.length > 0 ? { env_passthrough: envPassthrough } : {}),
-    ...(env && Object.keys(env).length > 0 ? { env } : {}),
+    ...(env && Object.keys(env).length > 0 ? { env: env as Record<string, string> } : {}),
   };
 }
 
@@ -346,7 +372,16 @@ export function buildSchemaFromDiscoveryBundle(options: {
         };
       }),
     },
-    warnings: bundle.normalized_bundle.warnings,
+    warnings: isStdioTransport && bundle.source.auth.type === "bearer"
+      ? [
+          ...bundle.normalized_bundle.warnings,
+          {
+            code: "STDIO_AUTH_IGNORED",
+            severity: "warning",
+            message: "Bearer auth does not apply to stdio upstreams and was dropped; pass credentials with overrides.stdio.env \"${env:VAR}\" references or env_passthrough.",
+          },
+        ]
+      : bundle.normalized_bundle.warnings,
   };
 }
 
@@ -1122,6 +1157,7 @@ async function getUpstreamClient(): Promise<Client> {
 const STDIO_UPSTREAM_RUNTIME = `let upstreamClient: Client | undefined;
 let upstreamTransport: StdioClientTransport | undefined;
 let upstreamConnecting: Promise<Client> | undefined;
+let startingTransport: StdioClientTransport | undefined;
 let upstreamExitNotice: string | undefined;
 let closingUpstream = false;
 
@@ -1203,11 +1239,14 @@ async function connectUpstream(): Promise<Client> {
       upstreamExitNotice = "The upstream process exited and its session state was lost. Retry to start a fresh upstream.";
     }
   };
+  startingTransport = transport;
   try {
     await client.connect(transport);
   } catch (error) {
     await transport.close();
     throw error;
+  } finally {
+    startingTransport = undefined;
   }
   // Shutdown may have started while the child was starting; it could not see this transport yet.
   if (closingUpstream) {
@@ -1688,7 +1727,7 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 
 async function closeUpstreamTransport() {
-${tenancy ? "  await closeTenantClients();\n" : ""}${stdio ? "  closingUpstream = true;\n" : ""}  if (upstreamTransport) {
+${tenancy ? "  await closeTenantClients();\n" : ""}${stdio ? "  closingUpstream = true;\n  // A child still starting is not yet upstreamTransport; stop it too so it is never orphaned.\n  await startingTransport?.close();\n" : ""}  if (upstreamTransport) {
     await upstreamTransport.close();
     upstreamTransport = undefined;
     upstreamClient = undefined;

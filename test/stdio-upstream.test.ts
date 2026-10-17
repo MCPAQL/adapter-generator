@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import readline from "node:readline";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -171,9 +171,9 @@ test("stdio README documents the launch command and child environment", () => {
   assert.match(readme, /`FIXTURE_PASS` \(optional\)/);
 });
 
-async function writeGeneratedAdapter(): Promise<string> {
+async function writeGeneratedAdapter(bundle: DiscoveryBundle = stdioBundle): Promise<string> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "mcpaql-stdio-adapter-"));
-  const output = buildSchemaFromDiscoveryBundle({ bundle: stdioBundle });
+  const output = buildSchemaFromDiscoveryBundle({ bundle });
   for (const file of generateAdapterPackage({ schema: output.schema, provenance: output.metadata }).files) {
     await mkdir(path.dirname(path.join(dir, file.path)), { recursive: true });
     await writeFile(path.join(dir, file.path), file.content);
@@ -309,11 +309,94 @@ test("closing the adapter's stdin without a signal stops the adapter and its chi
 
   const exited = once(adapter, "exit");
   adapter.stdin!.end();
+  let timer: NodeJS.Timeout | undefined;
   const [code, signal] = await Promise.race([
     exited,
-    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("adapter did not exit after stdin closed")), 10_000)),
-  ]);
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("adapter did not exit after stdin closed")), 10_000);
+    }),
+  ]).finally(() => clearTimeout(timer));
   assert.equal(signal, null);
   assert.equal(code, 0);
   assert.ok(await waitForExit(childPid, 10_000), `upstream child ${childPid} still running`);
+});
+
+test("redacted launch values are refused with guidance", () => {
+  const withEnv = (transport: Record<string, unknown>): DiscoveryBundle => ({
+    ...stdioBundle,
+    source: { ...stdioBundle.source, capture_config_redacted: { transport: { type: "stdio", command: "npx", ...transport } } },
+  });
+  assert.throws(
+    () => buildSchemaFromDiscoveryBundle({ bundle: withEnv({ env: { API_KEY: "<redacted>" } }) }),
+    /redacted values \(env\.API_KEY\).*overrides\.stdio/,
+  );
+  assert.throws(() => buildSchemaFromDiscoveryBundle({ bundle: withEnv({ args: ["--token", "<redacted>"] }) }), /args\[1\]/);
+  // Supplying the value through overrides fixes it.
+  const { schema } = buildSchemaFromDiscoveryBundle({
+    bundle: withEnv({ env: { API_KEY: "<redacted>", OTHER: "x" } }),
+    overrides: { stdio: { env: { API_KEY: "${env:API_KEY}" } } },
+  });
+  // An override replaces the whole env field.
+  assert.deepEqual(schema.target.stdio?.env, { API_KEY: "${env:API_KEY}" });
+});
+
+test("overrides.stdio fields are type-checked like captured ones", () => {
+  const bad = (stdio: Record<string, unknown>) => () =>
+    buildSchemaFromDiscoveryBundle({ bundle: stdioBundle, overrides: { stdio: stdio as never } });
+  assert.throws(bad({ env_passthrough: "HOME" }), /env_passthrough must be an array of strings/);
+  assert.throws(bad({ args: "oops" }), /args must be an array of strings/);
+  assert.throws(bad({ cwd: 5 }), /cwd must be a string/);
+  assert.throws(bad({ env: ["A"] }), /env must be an object/);
+});
+
+test("bearer auth on a stdio capture is dropped with a warning", () => {
+  const output = buildSchemaFromDiscoveryBundle({
+    bundle: { ...stdioBundle, source: { ...stdioBundle.source, auth: { type: "bearer", token_env: "X" } } },
+  });
+  assert.equal(output.schema.auth, undefined);
+  assert.ok(output.warnings.some((warning) => warning.code === "STDIO_AUTH_IGNORED"));
+});
+
+test("stopping the adapter while its child is still starting reaps the child", async (t) => {
+  const bundle: DiscoveryBundle = {
+    ...stdioBundle,
+    source: {
+      ...stdioBundle.source,
+      capture_config_redacted: {
+        ...stdioBundle.source.capture_config_redacted,
+        env_passthrough: ["FIXTURE_PASS", "FIXTURE_PID_FILE", "FIXTURE_START_DELAY_MS"],
+      },
+    },
+  };
+  const dir = await writeGeneratedAdapter(bundle);
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const pidFile = path.join(dir, "child.pid");
+  const adapter = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
+    cwd: dir,
+    env: { ...getDefaultEnvironment(), FIXTURE_SOURCE: "s", FIXTURE_PID_FILE: pidFile, FIXTURE_START_DELAY_MS: "60000" },
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  t.after(() => adapter.kill("SIGKILL"));
+  const lines = readline.createInterface({ input: adapter.stdout! });
+  const initialized = new Promise<void>((resolve) => lines.once("line", () => resolve()));
+  adapter.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "0" } } })}\n`);
+  await initialized;
+  adapter.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+  adapter.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "mcp_aql_read", arguments: { operation: "count" } } })}\n`);
+
+  let childPid: number | undefined;
+  const deadline = Date.now() + 10_000;
+  while (childPid === undefined && Date.now() < deadline) {
+    try {
+      childPid = Number(await readFile(pidFile, "utf8"));
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  assert.ok(childPid, "child never started");
+
+  const exited = once(adapter, "exit");
+  adapter.kill("SIGTERM");
+  await exited;
+  assert.ok(await waitForExit(childPid!, 10_000), `starting child ${childPid} was orphaned`);
 });
