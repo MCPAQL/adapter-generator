@@ -622,7 +622,7 @@ const CALL_CONTROL_SECTION = `Upstream calls follow the caller's cancellation an
 - \`MCPAQL_UPSTREAM_TIMEOUT_MS\` (default 60000): per-call deadline, reset by each upstream progress notification.
 - \`MCPAQL_UPSTREAM_MAX_TOTAL_TIMEOUT_MS\`: hard cap per call, regardless of progress; the upstream call is cancelled when it is reached.
 
-Every endpoint except EXECUTE also accepts a batch, \`{ operations: [{ operation, params }, ...] }\`, run in order (\`MCPAQL_MAX_BATCH_OPERATIONS\`, default 25). A batch stops before any dangerous or confirmation-gated operation, which must be called on its own; a batch's duration is the sum of its operations.
+Every endpoint except EXECUTE also accepts a batch, \`{ operations: [{ operation, params }, ...] }\`, run in order (\`MCPAQL_MAX_BATCH_OPERATIONS\`, default 25). A batch stops before any dangerous, destructive, or confirmation-gated operation, which must be called on its own; a batch's duration is the sum of its operations.
 `;
 
 function resultShapingSection(schema: AdapterSchemaDocument): string {
@@ -2117,6 +2117,7 @@ function singleCallReason(operation: string): string | undefined {
   if (!definition) return undefined;
   if (definition.requires_confirmation) return "requires confirmation";
   if (definition.danger_level === "dangerous") return "is dangerous";
+  if (definition.danger_level === "destructive") return "is destructive";
   if (definition.maps_to.startsWith("adapter:set_active_")) return "changes the active tenant for the operations after it";
   return undefined;
 }
