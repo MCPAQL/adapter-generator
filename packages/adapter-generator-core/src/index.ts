@@ -2117,6 +2117,7 @@ function singleCallReason(operation: string): string | undefined {
   if (!definition) return undefined;
   if (definition.requires_confirmation) return "requires confirmation";
   if (definition.danger_level === "dangerous") return "is dangerous";
+  if (definition.danger_level === "destructive") return "is destructive";
   if (definition.maps_to.startsWith("adapter:set_active_")) return "changes the active tenant for the operations after it";
   return undefined;
 }
